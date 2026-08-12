@@ -1,0 +1,18 @@
+[package]
+name = "ct2trainer"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately free of any PE library. Packaging appends the table past the
+# runtime PE's last section (see src/overlay.rs), so the only PE field this
+# crate reads is the COFF `Machine` word, by hand, to refuse an ELF or a
+# 32-bit image. Reaching for goblin here would be the first step back toward
+# rewriting the resource directory, which is what used to be broken.
+[dependencies]
+flate2 = "1.0"
+crc32fast = "1.5"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+byteorder = "1.5"

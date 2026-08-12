@@ -1,0 +1,49 @@
+[
+  {
+    "label": "decky: install deps",
+    "command": "pnpm i",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true,
+    "save": "all"
+  },
+  {
+    "label": "decky: update frontend lib",
+    "command": "pnpm update @decky/ui --latest",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true,
+    "save": "all"
+  },
+  {
+    "label": "decky: build",
+    "command": "./scripts/build-deck.sh",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true,
+    "save": "all"
+  },
+  {
+    "label": "decky: deploy",
+    "command": "./scripts/deploy-deck.sh",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true,
+    "save": "all"
+  },
+  {
+    "label": "decky: build + deploy",
+    "command": "./scripts/build-deploy-deck.sh",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true,
+    "save": "all"
+  },
+  {
+    "label": "decky: restart loader",
+    "command": "./scripts/deploy-deck.sh --restart-only",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true
+  },
+  {
+    "label": "decky: remote status",
+    "command": "./scripts/deploy-deck.sh --status",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true
+  }
+]

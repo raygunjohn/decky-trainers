@@ -1,0 +1,45 @@
+[package]
+name = "trainer-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quick-xml = "0.36"
+flate2 = "1.0"
+crc32fast = "1.5"
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+byteorder = "1.5"
+
+# The shipped trainer is always this target: a PE cross-compiled on Linux
+# (`--target x86_64-pc-windows-gnu`) that runs inside the game's Proton prefix.
+# A native build still compiles — it just has no process backend — because the
+# offline modes (--analyze, --verify-asm, --check-lua) are worth having on a
+# dev machine and on the Deck.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

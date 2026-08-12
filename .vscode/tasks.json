@@ -1,0 +1,121 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        //PRELIMINARY SETUP TASKS
+        //Dependency setup task
+        {
+            "label": "depsetup",
+            "type": "shell",
+            "group": "none",
+            "detail": "Install depedencies for basic setup",
+            "command": "${workspaceFolder}/.vscode/setup.sh",
+            // // placeholder for windows scripts, not currently planned
+            // "windows": {
+            //     "command": "call -c ${workspaceFolder}\\.vscode\\setup.bat",
+            // },
+            "problemMatcher": []
+        },
+        //pnpm setup task to grab all needed modules
+        {
+            "label": "pnpmsetup",
+            "type": "shell",
+            "group": "none",
+            "detail": "Setup pnpm",
+            "command": "which pnpm && pnpm i",
+            "problemMatcher": []
+        },
+        //Preliminary "All-in-one" setup task
+        {
+            "label": "setup",
+            "detail": "Set up depedencies, pnpm and update Decky Frontend Library.",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "depsetup",
+                "pnpmsetup",
+                "updatefrontendlib"
+            ],
+            "problemMatcher": []
+        },
+        //Preliminary Deploy Config Setup
+        {
+            "label": "settingscheck",
+            "type": "shell",
+            "group": "none",
+            "detail": "Check that settings.json has been created",
+            "command": "${workspaceFolder}/.vscode/config.sh",
+            // // placeholder for windows scripts, not currently planned
+            // "windows": {
+            //     "command": "call ${workspaceFolder}\\.vscode\\config.bat",
+            // },
+            "problemMatcher": []
+        },
+        //BUILD TASKS
+        {
+            "label": "cli-build",
+            "type": "shell",
+            "group": "build",
+            "detail": "Build plugin with Decky CLI",
+            "command": "${workspaceFolder}/scripts/build-deck.sh",
+            "problemMatcher": []
+        },
+        //"All-in-one" build task
+        {
+            "label": "build",
+            "group": "build",
+            "detail": "Build DeckyTrainers",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "settingscheck",
+                "cli-build"
+            ],
+            "problemMatcher": []
+        },
+        //DEPLOY TASKS
+        {
+            "label": "deploy",
+            "detail": "Deploy plugin zip to Steam Deck and restart Decky",
+            "type": "shell",
+            "group": "none",
+            "command": "${workspaceFolder}/scripts/deploy-deck.sh",
+            "problemMatcher": []
+        },
+        {
+            "label": "builddeploy",
+            "detail": "Build plugin, deploy to Steam Deck, and restart Decky",
+            "type": "shell",
+            "group": "none",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "settingscheck"
+            ],
+            "command": "${workspaceFolder}/scripts/build-deploy-deck.sh",
+            "problemMatcher": []
+        },
+        //GENERAL TASKS
+        //Update Decky Frontend Library, aka DFL
+        {
+            "label": "updatefrontendlib",
+            "type": "shell",
+            "group": "build",
+            "detail": "Update @decky/ui aka DFL",
+            "command": "pnpm update @decky/ui --latest",
+            "problemMatcher": []
+        },
+        {
+            "label": "restartdecky",
+            "detail": "Restart Decky on Steam Deck",
+            "type": "shell",
+            "group": "none",
+            "command": "${workspaceFolder}/scripts/deploy-deck.sh --restart-only",
+            "problemMatcher": []
+        },
+        {
+            "label": "deckstatus",
+            "detail": "Show deployed plugin and Decky service status",
+            "type": "shell",
+            "group": "none",
+            "command": "${workspaceFolder}/scripts/deploy-deck.sh --status",
+            "problemMatcher": []
+        }
+    ]
+}

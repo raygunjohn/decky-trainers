@@ -1,0 +1,16 @@
+{
+  "name": "DeckyTrainers",
+  "author": "raygunjohn",
+  "flags": [
+    "debug"
+  ],
+  "api_version": 1,
+  "publish": {
+    "tags": [
+      "game",
+      "utility"
+    ],
+    "description": "Build a trainer from any CT table on the Deck, access features from the plugin Menu.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+  }
+}

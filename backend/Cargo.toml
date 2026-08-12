@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "ct2trainer",
+    "trainer-runtime",
+]
+resolver = "2"
