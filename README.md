@@ -7,6 +7,10 @@ drives its toggles and value editors from the Quick Access Menu.
 The point: **a player never leaves Gamescope mode.** Pick a table, press a
 button, flip cheats with the gamepad. No PC, no browser, no keyboard.
 
+## Demo video
+
+[![DeckyTrainers Demo Video](https://img.youtube.com/vi/SoVDkeHuqhU/maxresdefault.jpg)](https://youtu.be/SoVDkeHuqhU)
+
 ## Install
 
 Requires [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader).
