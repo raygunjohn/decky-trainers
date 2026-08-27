@@ -203,7 +203,7 @@ def find_game_process(appid: str, trainer_names=()):
     for pid in iter_pids():
         try:
             env = read_environ(pid)
-            if env.get("SteamGameId") != appid:
+            if appid not in (env.get("SteamGameId"), env.get("SteamAppId")):
                 continue
             if "STEAM_COMPAT_DATA_PATH" not in env and "WINEPREFIX" not in env:
                 continue  # native process (reaper, ...)
