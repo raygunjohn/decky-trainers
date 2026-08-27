@@ -20,7 +20,7 @@ mode**, open the **Developer** tab, and paste this into **Install Plugin from
 URL**:
 
 ```
-https://github.com/raygunjohn/decky-trainers/releases/download/v0.1.1/DeckyTrainers.zip
+https://github.com/raygunjohn/decky-trainers/releases/download/v0.1.2/DeckyTrainers.zip
 ```
 
 Or download `DeckyTrainers.zip` from the
