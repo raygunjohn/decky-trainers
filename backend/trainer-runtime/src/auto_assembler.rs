@@ -19,7 +19,7 @@
 //! pointing at freshly allocated, zeroed memory.
 
 use crate::aob_scanner::{aob_scan, parse_aob_pattern};
-use crate::assembler::{assemble_with, parse_number};
+use crate::assembler::{assemble_mode, parse_number, Mode};
 use crate::process::GameProcess;
 use crate::lua_engine::{ExecEnv, LuaCtx, RecordView};
 use crate::symbol_handler::SymbolHandler;
@@ -590,6 +590,10 @@ impl AutoAssemblerScript {
             // and must not pay for an allocation it will never use.
             if code_lines.is_empty() {
                 None
+            } else if !process.is_64bit {
+                // Every address in a 32-bit process is within rel32 reach,
+                // so the assembler never asks for a slot (see `rel32`).
+                Some(FarPool::default())
             } else {
                 Some(self.make_far_pool(process, &alloc_requests, symbols))
             }
@@ -1019,7 +1023,8 @@ impl AutoAssemblerScript {
             })
         };
         let far = |target: u64| far_pool.slot(target);
-        assemble_with(t, addr, &resolver, &far).with_context(|| format!("assembling '{}'", t))
+        assemble_mode(Mode::for_target(process.is_64bit), t, addr, &resolver, &far)
+            .with_context(|| format!("assembling '{}'", t))
     }
 }
 

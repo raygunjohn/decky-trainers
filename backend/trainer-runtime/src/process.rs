@@ -34,6 +34,16 @@ impl GameProcess {
         };
 
         proc.refresh_modules()?;
+        // The bitness decides the assembler mode and every pointer width, so
+        // say which one was picked - a 32-bit (WoW64) game looks identical
+        // from the outside otherwise.
+        tracing::info!(
+            "attached to {} (pid {}): {} process, {} modules",
+            proc.name,
+            proc.pid,
+            if proc.is_64bit { "64-bit" } else { "32-bit (WoW64)" },
+            proc.modules.len()
+        );
         Ok(proc)
     }
 

@@ -10,6 +10,12 @@
 //! Branches and RIP-relative operands always encode with 32-bit displacements so
 //! an instruction's length never depends on the value of a symbol. That keeps
 //! sizes stable between the layout pass and the emit pass.
+//!
+//! [`Mode::Bits32`] encodes for a 32-bit (WoW64) game instead. The syntax is
+//! the same; what changes is that no REX prefix exists, an absolute operand is
+//! a plain disp32 rather than RIP-relative, and every branch is reachable with
+//! a rel32 because addresses wrap at 4GB. A 64-bit register in 32-bit mode is
+//! an error, never a silent re-encoding.
 
 use anyhow::{bail, Result};
 
@@ -22,6 +28,26 @@ pub type Resolver<'a> = &'a dyn Fn(&str) -> Option<u64>;
 /// Windows APIs sit hundreds of gigabytes from a game module, so
 /// `call kernel32.Sleep` from injected code has to go through a pointer.
 pub type FarSlots<'a> = &'a dyn Fn(u64) -> Option<u64>;
+
+/// Bitness of the process the code is assembled for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// IA-32: the encoding a WoW64 game runs.
+    Bits32,
+    /// x86-64, the default and the only mode most tables need.
+    #[default]
+    Bits64,
+}
+
+impl Mode {
+    pub fn for_target(is_64bit: bool) -> Self {
+        if is_64bit {
+            Mode::Bits64
+        } else {
+            Mode::Bits32
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegKind {
@@ -114,12 +140,16 @@ struct Insn {
     imm: Vec<u8>,
     rip_rel: bool,
     rip_target: u64,
+    mode: Mode,
 }
 
 impl Insn {
     fn emit(&self, addr: u64) -> Result<Vec<u8>> {
         // VEX replaces both the legacy prefixes and REX.
         if let Some(vex) = self.vex {
+            if self.mode == Mode::Bits32 && (self.rex_r || self.rex_x || self.rex_b || vex.w) {
+                bail!("xmm8-15 and 64-bit operands do not exist in 32-bit mode");
+            }
             let mut v = Vec::new();
             let need_three = self.rex_x || self.rex_b || vex.mmmmm != 1 || vex.w;
             let bit = |set: bool| if set { 0u8 } else { 1u8 }; // VEX stores these inverted
@@ -161,6 +191,9 @@ impl Insn {
         let has_rex = self.rex_w || self.rex_r || self.rex_x || self.rex_b || self.need_rex;
         if has_rex && self.forbid_rex {
             bail!("cannot encode ah/ch/dh/bh together with an extended register or 64-bit operand");
+        }
+        if has_rex && self.mode == Mode::Bits32 {
+            bail!("64-bit registers, r8-r15 and spl/bpl/sil/dil do not exist in 32-bit mode");
         }
 
         let mut v = self.prefixes.clone();
@@ -263,10 +296,25 @@ impl Insn {
         if m.base.is_none() && m.index.is_none() {
             let target = m.abs.unwrap_or(m.disp as u64);
             self.modrm = Some(reg_field | 0b0000_0101); // mod=00, rm=101 => RIP+disp32
+            if self.mode == Mode::Bits32 {
+                // The same ModRM is a plain disp32 in 32-bit mode.
+                if target > u32::MAX as u64 {
+                    bail!("address {:#X} does not fit a 32-bit process", target);
+                }
+                self.disp = (target as u32).to_le_bytes().to_vec();
+                return Ok(());
+            }
             self.disp = vec![0, 0, 0, 0];
             self.rip_rel = true;
             self.rip_target = target;
             return Ok(());
+        }
+
+        if self.mode == Mode::Bits32 {
+            let is_64 = |r: Option<Reg>| matches!(r, Some(r) if r.kind == RegKind::G64);
+            if is_64(m.base) || is_64(m.index) {
+                bail!("64-bit address registers do not exist in 32-bit mode");
+            }
         }
 
         if let Some(ix) = m.index {
@@ -655,6 +703,21 @@ fn reject_self_overlapping_branch(mnem: &str, addr: u64, len: u64, target: u64) 
     Ok(())
 }
 
+/// Displacement of `target` from `next` (the end of the branch), or `None`
+/// when a rel32 cannot express it.
+///
+/// Addresses wrap at 4GB in 32-bit mode, so there a rel32 always reaches and
+/// the far-pointer fallback is never needed.
+fn rel32(mode: Mode, target: u64, next: u64) -> Option<i32> {
+    match mode {
+        Mode::Bits32 => Some(target.wrapping_sub(next) as u32 as i32),
+        Mode::Bits64 => {
+            let d = target.wrapping_sub(next) as i64;
+            (d >= i32::MIN as i64 && d <= i32::MAX as i64).then_some(d as i32)
+        }
+    }
+}
+
 /// Strips a branch-distance hint. Tables write `jmp short x`; the distance is
 /// implied by the encoding chosen here, so the keyword carries no information.
 fn strip_distance_hint(s: &str) -> &str {
@@ -947,6 +1010,18 @@ pub fn assemble_with(
     resolve: Resolver,
     far: FarSlots,
 ) -> Result<Vec<u8>> {
+    assemble_mode(Mode::Bits64, line, addr, resolve, far)
+}
+
+/// [`assemble_with`] for a given target bitness. `far` is never consulted in
+/// 32-bit mode.
+pub fn assemble_mode(
+    mode: Mode,
+    line: &str,
+    addr: u64,
+    resolve: Resolver,
+    far: FarSlots,
+) -> Result<Vec<u8>> {
     let (mnem, ops) = split_line(line);
     if mnem.is_empty() {
         return Ok(Vec::new());
@@ -980,7 +1055,13 @@ pub fn assemble_with(
         Ok(acc as u64)
     };
 
-    let mut insn = Insn::default();
+    let mut insn = Insn { mode, ..Default::default() };
+    let only64 = |what: &str| -> Result<()> {
+        if mode == Mode::Bits32 {
+            bail!("{} does not exist in 32-bit mode", what);
+        }
+        Ok(())
+    };
 
     match mnem.as_str() {
         // ---- zero-operand -------------------------------------------------
@@ -1011,8 +1092,14 @@ pub fn assemble_with(
         "pushad" | "pusha" => return Ok(vec![0x60]),
         "popad" | "popa" => return Ok(vec![0x61]),
         "cdq" => return Ok(vec![0x99]),
-        "cqo" => return Ok(vec![0x48, 0x99]),
-        "cdqe" => return Ok(vec![0x48, 0x98]),
+        "cqo" => {
+            only64("cqo")?;
+            return Ok(vec![0x48, 0x99]);
+        }
+        "cdqe" => {
+            only64("cdqe")?;
+            return Ok(vec![0x48, 0x98]);
+        }
         "leave" => return Ok(vec![0xC9]),
         "enter" => {
             let frame = ops.first().and_then(|s| parse_number(s)).unwrap_or(0);
@@ -1052,10 +1139,16 @@ pub fn assemble_with(
         "ud2" => return Ok(vec![0x0F, 0x0B]),
         "movsb" => return Ok(vec![0xA4]),
         "movsw" => return Ok(vec![0x66, 0xA5]),
-        "movsq" => return Ok(vec![0x48, 0xA5]),
+        "movsq" => {
+            only64("movsq")?;
+            return Ok(vec![0x48, 0xA5]);
+        }
         "stosb" => return Ok(vec![0xAA]),
         "stosw" => return Ok(vec![0x66, 0xAB]),
-        "stosq" => return Ok(vec![0x48, 0xAB]),
+        "stosq" => {
+            only64("stosq")?;
+            return Ok(vec![0x48, 0xAB]);
+        }
         "lodsb" => return Ok(vec![0xAC]),
         "scasb" => return Ok(vec![0xAE]),
         "cmpsb" => return Ok(vec![0xA6]),
@@ -1084,7 +1177,7 @@ pub fn assemble_with(
                 return Ok(vec![prefix]);
             }
             let mut v = vec![prefix];
-            v.extend_from_slice(&assemble(rest, addr.wrapping_add(1), resolve)?);
+            v.extend_from_slice(&assemble_mode(mode, rest, addr.wrapping_add(1), resolve, far)?);
             return Ok(v);
         }
     }
@@ -1094,7 +1187,10 @@ pub fn assemble_with(
         "loop" | "loope" | "loopne" | "loopz" | "loopnz" | "jrcxz" | "jecxz" => {
             let t = ops.first().ok_or_else(|| anyhow::anyhow!("{} needs a target", mnem))?;
             let target = branch_target(t)?;
-            let rel = target.wrapping_sub(addr.wrapping_add(2)) as i64;
+            let rel = match mode {
+                Mode::Bits32 => target.wrapping_sub(addr.wrapping_add(2)) as u32 as i32 as i64,
+                Mode::Bits64 => target.wrapping_sub(addr.wrapping_add(2)) as i64,
+            };
             if !(-128..=127).contains(&rel) {
                 bail!("{} target is out of the ±128 byte range of a short branch", mnem);
             }
@@ -1123,8 +1219,7 @@ pub fn assemble_with(
                 }
             }
             let target = branch_target(t)?;
-            let rel = target.wrapping_sub(addr.wrapping_add(5)) as i64;
-            if rel < i32::MIN as i64 || rel > i32::MAX as i64 {
+            let Some(rel) = rel32(mode, target, addr.wrapping_add(5)) else {
                 // Too far for rel32: go indirect through a pointer slot,
                 // `call/jmp qword ptr [rip+disp32]` (always 6 bytes, so the
                 // layout pass measures the same length).
@@ -1138,10 +1233,10 @@ pub fn assemble_with(
                 let mut v = vec![0xFF, if mnem == "jmp" { 0x25 } else { 0x15 }];
                 v.extend_from_slice(&(disp as i32).to_le_bytes());
                 return Ok(v);
-            }
+            };
             reject_self_overlapping_branch(&mnem, addr, 5, target)?;
             let mut v = vec![if mnem == "jmp" { 0xE9 } else { 0xE8 }];
-            v.extend_from_slice(&(rel as i32).to_le_bytes());
+            v.extend_from_slice(&rel.to_le_bytes());
             return Ok(v);
         }
 
@@ -1152,6 +1247,9 @@ pub fn assemble_with(
                 // 0x50+rd covers `push rax` (64-bit mode) and `push eax`
                 // (32-bit tables); 16-bit takes an operand-size prefix.
                 Op::R(r) if matches!(r.kind, RegKind::G64 | RegKind::G32 | RegKind::G16) => {
+                    if r.kind == RegKind::G64 || r.num >= 8 {
+                        only64("push of a 64-bit or extended register")?;
+                    }
                     let mut v = Vec::new();
                     if r.kind == RegKind::G16 {
                         v.push(0x66);
@@ -1183,6 +1281,9 @@ pub fn assemble_with(
             let t = ops.first().ok_or_else(|| anyhow::anyhow!("pop needs an operand"))?;
             match parse_operand(t, resolve)? {
                 Op::R(r) if matches!(r.kind, RegKind::G64 | RegKind::G32 | RegKind::G16) => {
+                    if r.kind == RegKind::G64 || r.num >= 8 {
+                        only64("pop of a 64-bit or extended register")?;
+                    }
                     let mut v = Vec::new();
                     if r.kind == RegKind::G16 {
                         v.push(0x66);
@@ -1210,13 +1311,12 @@ pub fn assemble_with(
         if let Some(cc) = cond_code(rest) {
             let t = ops.first().ok_or_else(|| anyhow::anyhow!("{} needs a target", mnem))?;
             let target = branch_target(t)?;
-            let rel = target.wrapping_sub(addr.wrapping_add(6)) as i64;
-            if rel < i32::MIN as i64 || rel > i32::MAX as i64 {
+            let Some(rel) = rel32(mode, target, addr.wrapping_add(6)) else {
                 bail!("{} target {:#X} is out of ±2GB range", mnem, target);
-            }
+            };
             reject_self_overlapping_branch(&mnem, addr, 6, target)?;
             let mut v = vec![0x0F, 0x80 + cc];
-            v.extend_from_slice(&(rel as i32).to_le_bytes());
+            v.extend_from_slice(&rel.to_le_bytes());
             return Ok(v);
         }
     }
@@ -1564,6 +1664,7 @@ pub fn assemble_with(
             (Op::R(d), Op::I(n)) => {
                 let sz = d.size();
                 if sz == 8 {
+                    only64("a 64-bit register")?;
                     // Prefer the compact 32-bit sign-extended form when possible.
                     if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 {
                         insn.rex_w = true;
@@ -1630,6 +1731,9 @@ pub fn assemble_with(
         };
         let src = parse_operand(&ops[1], resolve)?;
         let src_sz = op_size(&src).unwrap_or(1);
+        if mnem == "movsxd" {
+            only64("movsxd")?;
+        }
         insn.apply_operand_size(d.size());
         insn.opcode = if mnem == "movsxd" {
             vec![0x63]
@@ -2401,6 +2505,139 @@ mod tests {
         assert_eq!(parse_number("(dword)5"), None);
     }
 
+}
+
+/// 32-bit mode. The syntax of a 32-bit table is the one CE's assembler
+/// accepts for an IA-32 target: the expected bytes below are what it emits.
+#[cfg(test)]
+mod bits32_tests {
+    use super::*;
+
+    fn asm32(line: &str, addr: u64, syms: &[(&str, u64)]) -> Result<Vec<u8>> {
+        let f = |n: &str| {
+            syms.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| *v)
+        };
+        assemble_mode(Mode::Bits32, line, addr, &f, &|_| None)
+    }
+
+    fn ok32(line: &str) -> Vec<u8> {
+        asm32(line, 0x0040_1000, &[]).unwrap_or_else(|e| panic!("{}: {}", line, e))
+    }
+
+    /// `mov eax,[00A3B5C0]` is `A1`/`8B 05` + disp32, not RIP-relative: the
+    /// bytes must be the address itself, wherever the instruction sits.
+    #[test]
+    fn absolute_operands_are_plain_disp32() {
+        let v = asm32("mov eax,[_pPlayer]", 0x0040_1000, &[("_pPlayer", 0x00A3_B5C0)]).unwrap();
+        assert_eq!(v, vec![0x8B, 0x05, 0xC0, 0xB5, 0xA3, 0x00]);
+        // Same bytes from a different address: no RIP arithmetic.
+        let w = asm32("mov eax,[_pPlayer]", 0x1000_0000, &[("_pPlayer", 0x00A3_B5C0)]).unwrap();
+        assert_eq!(v, w);
+        // Store direction and immediate-to-memory follow the same rule.
+        assert_eq!(
+            asm32("mov [_hp],ecx", 0x0040_1000, &[("_hp", 0x0050_0000)]).unwrap(),
+            vec![0x89, 0x0D, 0x00, 0x00, 0x50, 0x00]
+        );
+        assert_eq!(
+            asm32("mov [_hp],1", 0x0040_1000, &[("_hp", 0x0050_0000)]).unwrap(),
+            vec![0xC7, 0x05, 0x00, 0x00, 0x50, 0x00, 0x01, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// The common 32-bit hook shapes: no REX anywhere.
+    #[test]
+    fn classic_32bit_instructions() {
+        assert_eq!(ok32("mov eax,[ebp+08]"), vec![0x8B, 0x45, 0x08]);
+        assert_eq!(ok32("mov [esi+2C],eax"), vec![0x89, 0x46, 0x2C]);
+        assert_eq!(ok32("mov eax,[esp+04]"), vec![0x8B, 0x44, 0x24, 0x04]);
+        assert_eq!(ok32("push eax"), vec![0x50]);
+        assert_eq!(ok32("pop edi"), vec![0x5F]);
+        assert_eq!(ok32("pushad"), vec![0x60]);
+        assert_eq!(ok32("fld dword ptr [esi+10]"), vec![0xD9, 0x46, 0x10]);
+        assert_eq!(ok32("movss [edi+14],xmm0"), vec![0xF3, 0x0F, 0x11, 0x47, 0x14]);
+        assert_eq!(ok32("cmp dword ptr [eax],0"), vec![0x83, 0x38, 0x00]);
+        assert_eq!(ok32("lea ecx,[ebx+edx*4+10]"), vec![0x8D, 0x4C, 0x93, 0x10]);
+        assert_eq!(ok32("call dword ptr [eax+40]"), vec![0xFF, 0x50, 0x40]);
+        assert_eq!(ok32("mov ecx,#500"), vec![0xB9, 0xF4, 0x01, 0x00, 0x00]);
+        assert_eq!(ok32("ret"), vec![0xC3]);
+    }
+
+    /// Branches wrap at 4GB: a jump across the whole address space is still a
+    /// rel32, and the far-pointer fallback is never consulted.
+    #[test]
+    fn branches_always_reach() {
+        let v = asm32("jmp 1100", 0x1000, &[]).unwrap();
+        assert_eq!(v, vec![0xE9, 0xFB, 0x00, 0x00, 0x00]);
+        // 0x00401000 -> 0xFFFF0000: out of ±2GB as a signed distance, but
+        // the CPU wraps it, so rel = target - next (mod 2^32).
+        let v = asm32("jmp FFFF0000", 0x0040_1000, &[]).unwrap();
+        assert_eq!(v[0], 0xE9);
+        let rel = u32::from_le_bytes([v[1], v[2], v[3], v[4]]);
+        assert_eq!(0x0040_1005u32.wrapping_add(rel), 0xFFFF_0000);
+        let v = asm32("jne FFFF0000", 0x0040_1000, &[]).unwrap();
+        assert_eq!(v[0..2], [0x0F, 0x85]);
+        let rel = u32::from_le_bytes([v[2], v[3], v[4], v[5]]);
+        assert_eq!(0x0040_1006u32.wrapping_add(rel), 0xFFFF_0000);
+        // Same for the system call path: kernel32 is in reach without a slot.
+        let v = asm32("call kernel32.Sleep", 0x0040_1000, &[("kernel32.Sleep", 0x7C80_2446)])
+            .unwrap();
+        assert_eq!(v[0], 0xE8);
+        assert_eq!(v.len(), 5);
+    }
+
+    /// A 64-bit register in a 32-bit table is a table bug, and silently
+    /// encoding it as its 32-bit half would corrupt the game.
+    #[test]
+    fn x86_64_only_forms_are_rejected() {
+        for line in [
+            "mov rax,rcx",
+            "mov rax,[ebp+08]",
+            "mov eax,[rbx+08]",
+            "mov eax,[ebx+rcx*4]",
+            "push rax",
+            "pop r8",
+            "mov r8d,eax",
+            "mov r8l,1",
+            "mov sil,al",
+            "movsxd eax,[ebx]",
+            "cqo",
+            "cdqe",
+            "movsq",
+            "stosq",
+            "vmovss xmm8,[eax]",
+            "cvtsi2ss xmm0,rax",
+            "mov rax,123456789AB",
+        ] {
+            assert!(asm32(line, 0x0040_1000, &[]).is_err(), "{} must be rejected", line);
+        }
+        // ah/ch/dh/bh are fine: they never needed a REX.
+        assert_eq!(ok32("mov ah,al"), vec![0x88, 0xC4]);
+        // An absolute address above 4GB cannot belong to a 32-bit process.
+        assert!(asm32("mov eax,[big]", 0x0040_1000, &[("big", 0x1_0000_0000)]).is_err());
+    }
+
+    /// The default mode is unchanged: every existing 64-bit caller keeps the
+    /// same bytes.
+    #[test]
+    fn bits64_is_the_default() {
+        let f = |_: &str| None;
+        assert_eq!(
+            assemble("mov rcx,rsi", 0x1000, &f).unwrap(),
+            assemble_mode(Mode::Bits64, "mov rcx,rsi", 0x1000, &f, &|_| None).unwrap()
+        );
+        assert_eq!(Mode::for_target(true), Mode::Bits64);
+        assert_eq!(Mode::for_target(false), Mode::Bits32);
+    }
+
+    /// `rep movsb` recurses into the inner instruction; the mode has to
+    /// survive the recursion.
+    #[test]
+    fn prefixed_instructions_keep_the_mode() {
+        assert_eq!(ok32("rep movsb"), vec![0xF3, 0xA4]);
+        assert!(asm32("rep movsq", 0x0040_1000, &[]).is_err());
+    }
 }
 
 #[cfg(test)]

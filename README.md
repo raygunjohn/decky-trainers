@@ -116,7 +116,10 @@ Deck (Linux)                          Game's Proton prefix (Windows)
 
 - **Single-player games only**
 - **One trainer at a time**
-- **x86-64 only**
+- **32-bit games are untested on hardware.** The 64-bit trainer detects a
+  WoW64 game when it attaches and assembles 32-bit code for it, but
+  `createthread` from a 64-bit process into a 32-bit one under Proton has not
+  been verified.
 - **Global hotkeys from a table do not fire.** (todo)
 
 ## License

@@ -26,9 +26,9 @@ struct Cli {
     #[arg(short, long)]
     output: PathBuf,
 
-    /// Target bitness. Only 64 is supported: the assembler is an x86-64
-    /// encoder and no 32-bit runtime is built, so this exists to reject a
-    /// stale `--bits 32` loudly rather than to select anything.
+    /// Target bitness, 32 or 64. Informational: the same 64-bit runtime
+    /// serves both and picks the encoding when it attaches, so this only
+    /// rejects a value that is neither.
     #[arg(short, long, default_value_t = 64)]
     bits: u32,
 
@@ -50,12 +50,12 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    if cli.bits != 64 {
-        anyhow::bail!(
-            "--bits {} is not supported: the assembler is an x86-64 encoder and no 32-bit \
-             runtime is built. Drop the flag or pass --bits 64.",
-            cli.bits
-        );
+    // Both values produce the same trainer: the (64-bit) runtime detects a
+    // WoW64 game when it attaches and assembles 32-bit code for it. The flag
+    // survives so a caller can still say what it expects, and so anything
+    // else is caught here rather than at run time.
+    if cli.bits != 64 && cli.bits != 32 {
+        anyhow::bail!("--bits {} is not supported: pass 32 or 64.", cli.bits);
     }
 
     let comp_level = match cli.compression.to_lowercase().as_str() {
