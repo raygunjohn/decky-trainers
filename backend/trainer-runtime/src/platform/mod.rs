@@ -37,6 +37,11 @@ use std::collections::HashMap;
 #[cfg(windows)]
 mod win32;
 
+// Platform-independent on purpose: it only needs a memory reader, and
+// that is what lets it be tested here.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod peb32;
+
 // Linux and macOS dev hosts: the engine still parses tables, assembles, and
 // runs the offline analysis modes; it just cannot attach.
 #[cfg(not(windows))]
