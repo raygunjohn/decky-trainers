@@ -817,7 +817,7 @@ impl AutoAssemblerScript {
                 bail!("instruction '{}' appears before any address or label", line.trim());
             }
 
-            let len = self.measure_line(line, addr, process, symbols, label_addrs, far_pool)?;
+            let len = self.measure_line(line, addr, process, symbols, label_addrs, &known, far_pool)?;
             if let Some(b) = cur.as_mut() {
                 b.lines.push((line.clone(), len));
             }
@@ -844,10 +844,11 @@ impl AutoAssemblerScript {
         process: &GameProcess,
         symbols: &SymbolHandler,
         label_addrs: &HashMap<String, u64>,
+        known_labels: &[String],
         far_pool: &FarPool,
     ) -> Result<usize> {
         Ok(self
-            .assemble_line_inner(line, addr, process, symbols, label_addrs, true, far_pool)?
+            .assemble_line_inner(line, addr, process, symbols, label_addrs, Some(known_labels), far_pool)?
             .len())
     }
 
@@ -862,7 +863,7 @@ impl AutoAssemblerScript {
         label_addrs: &HashMap<String, u64>,
         far_pool: &FarPool,
     ) -> Result<Vec<u8>> {
-        self.assemble_line_inner(line, addr, process, symbols, label_addrs, false, far_pool)
+        self.assemble_line_inner(line, addr, process, symbols, label_addrs, None, far_pool)
     }
 
     fn assemble_line_inner(
@@ -872,9 +873,12 @@ impl AutoAssemblerScript {
         process: &GameProcess,
         symbols: &SymbolHandler,
         label_addrs: &HashMap<String, u64>,
-        lenient: bool,
+        // `Some(labels)` is the layout pass: unknown names get a placeholder
+        // (see `layout_placeholder`). `None` is the emit pass, which is strict.
+        layout_labels: Option<&[String]>,
         far_pool: &FarPool,
     ) -> Result<Vec<u8>> {
+        let lenient = layout_labels.is_some();
         let t = line.trim();
         let lower = t.to_lowercase();
 
@@ -1015,12 +1019,8 @@ impl AutoAssemblerScript {
         }
 
         let resolver = |name: &str| {
-            resolve_name(name, process, symbols, label_addrs).or(if lenient {
-                // Placeholder for a label defined further down the script.
-                Some(addr)
-            } else {
-                None
-            })
+            resolve_name(name, process, symbols, label_addrs)
+                .or_else(|| layout_labels.and_then(|labels| layout_placeholder(name, addr, labels)))
         };
         let far = |target: u64| far_pool.slot(target);
         assemble_mode(Mode::for_target(process.is_64bit), t, addr, &resolver, &far)
@@ -1031,6 +1031,28 @@ impl AutoAssemblerScript {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The layout pass's stand-in for a label defined further down the script.
+///
+/// A name the script declares as a label always gets one, even if it would
+/// parse as hex (`label(dead)` ... `jmp dead`): the emit pass resolves it as
+/// the label, so layout has to measure it as one. Otherwise only something
+/// that *could* be a label gets one. A numeric literal the symbol handler
+/// does not understand (`#1`, `(float)1`, `$10`) must stay a number: the
+/// placeholder is a full address, so `add ebx,#1` measured as `add
+/// r/m32,imm32` (6 bytes) in layout and emitted as `imm8` (3 bytes), and
+/// every label after it was off by three.
+fn layout_placeholder(name: &str, addr: u64, known_labels: &[String]) -> Option<u64> {
+    let name = name.trim();
+    if known_labels.iter().any(|l| l.eq_ignore_ascii_case(name)) {
+        return Some(addr);
+    }
+    if parse_number(name).is_some() {
+        None
+    } else {
+        Some(addr)
+    }
+}
 
 fn resolve_name(
     name: &str,
@@ -1847,6 +1869,37 @@ dd 0
             )
             .unwrap();
         assert_eq!(out.as_deref(), Some("4"));
+    }
+
+    /// `add ebx,#1` once measured 6 bytes in layout and emitted 3: the layout
+    /// resolver handed every unknown name a placeholder address, including a
+    /// `#`-decimal literal, which turned an imm8 into an imm32 for one pass.
+    #[test]
+    fn layout_placeholder_never_stands_in_for_a_number() {
+        use crate::assembler::assemble;
+        let none: Vec<String> = vec![];
+        for lit in ["#1", "1", "28", "0x10", "$10", "(float)1", "(int)100", "-1"] {
+            assert_eq!(layout_placeholder(lit, 0x1000, &none), None, "{} is a number", lit);
+        }
+        assert_eq!(layout_placeholder("newmem", 0x1000, &none), Some(0x1000));
+        assert_eq!(layout_placeholder("kernel32.Sleep", 0x1000, &none), Some(0x1000));
+        // A declared label wins over its hex reading, as it does at emit.
+        let labels = vec!["dead".to_string(), "Fade".to_string()];
+        assert_eq!(layout_placeholder("dead", 0x1000, &labels), Some(0x1000));
+        assert_eq!(layout_placeholder("fade", 0x1000, &labels), Some(0x1000));
+        assert_eq!(layout_placeholder("beef", 0x1000, &labels), None);
+
+        // Both passes must agree on the length of an immediate form.
+        let layout = |n: &str| layout_placeholder(n, 0x7FF6_0100_0000, &none);
+        let emit = |_: &str| None;
+        for line in ["add ebx,#1", "add rsp,28", "cmp eax,#500", "sub ecx,(int)7"] {
+            assert_eq!(
+                assemble(line, 0x1000, &layout).unwrap().len(),
+                assemble(line, 0x1000, &emit).unwrap().len(),
+                "{} changes length between passes",
+                line
+            );
+        }
     }
 
     /// The hook itself must be exactly 5 bytes of `jmp rel32` plus one `nop`,
