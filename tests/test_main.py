@@ -34,6 +34,7 @@ import remote  # noqa: E402
 import library  # noqa: E402
 import generate as generate_mod  # noqa: E402
 from main import Plugin  # noqa: E402
+import main as main_mod  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -242,7 +243,67 @@ async def main():
     check("listing cache gone too, refetches", listing["cached"], False)
 
 
+def fake_proc(port: int, owners):
+    """A /proc with one LISTEN socket on `port` and the given owners:
+    (pid, comm, argv0) triples, each holding a copy of the socket."""
+    proc = tempfile.mkdtemp(prefix="deck-proc-")
+    os.makedirs(os.path.join(proc, "net"))
+    inode = 424242
+    with open(os.path.join(proc, "net", "tcp"), "w") as handle:
+        handle.write("  sl  local_address rem_address   st ...\n")
+        handle.write(
+            f"   0: 0100007F:{port:04X} 00000000:0000 0A 00000000:00000000 "
+            f"00:00000000 00000000  1000        0 {inode} 1 0 100 0 0 10 0\n"
+        )
+    for pid, comm, argv0 in owners:
+        os.makedirs(os.path.join(proc, pid, "fd"))
+        with open(os.path.join(proc, pid, "comm"), "w") as handle:
+            handle.write(comm + "\n")
+        with open(os.path.join(proc, pid, "cmdline"), "wb") as handle:
+            handle.write(argv0.encode() + b"\0")
+        os.symlink(f"socket:[{inode}]", os.path.join(proc, pid, "fd", "7"))
+    return proc
+
+
+def socket_owner_tests():
+    section("socket_owner_pids")
+    # What the Deck actually shows: the trainer's wine process (comm "main")
+    # and the game's wineserver both hold the listening socket.
+    proc = fake_proc(42069, [
+        ("100", "main", "Z:\\home\\deck\\trainers\\X.exe"),
+        ("200", "wineserver", "/opt/proton/bin/wineserver"),
+    ])
+    check("wineserver is not an owner", main_mod.socket_owner_pids(42069, proc=proc), ["100"])
+    check("is_wineserver by comm", main_mod.is_wineserver("200", proc), True)
+    check("trainer is not a wineserver", main_mod.is_wineserver("100", proc), False)
+    check("unknown pid is not a wineserver", main_mod.is_wineserver("999", proc), False)
+    check("other ports have no owners", main_mod.socket_owner_pids(1, proc=proc), [])
+    shutil.rmtree(proc, ignore_errors=True)
+
+    check("Z: maps to /", main_mod.wine_path_to_unix("Z:\\home\\deck\\t\\X.exe"), "/home/deck/t/X.exe")
+    check("other drives keep their letter", main_mod.wine_path_to_unix("C:\\x\\Y.exe"), "C:/x/Y.exe")
+
+    section("_adopt_from_socket")
+    plugin = Plugin()
+    plugin.settings = {}
+    plugin.proc = None
+    saved = (main_mod.socket_owner_pids, main_mod.read_cmdline, os.readlink)
+    main_mod.socket_owner_pids = lambda port, proc="/proc": ["100"]
+    main_mod.read_cmdline = lambda pid: ["Z:\\home\\deck\\trainers\\X.exe"]
+    os.readlink = lambda p: "/opt/proton/lib/wine/i386-unix/wine64-preloader"
+    try:
+        check("adopts", plugin._adopt_from_socket(), True)
+        check("adopted name is the trainer, not the preloader", plugin.trainer_name, "X.exe")
+        check("adopted path is the unix path", plugin.trainer_path, "/home/deck/trainers/X.exe")
+        main_mod.read_cmdline = lambda pid: ["/usr/local/bin/native-trainer"]
+        plugin._adopt_from_socket()
+        check("non-wine trainer falls back to exe", plugin.trainer_name, "wine64-preloader")
+    finally:
+        main_mod.socket_owner_pids, main_mod.read_cmdline, os.readlink = saved
+
+
 asyncio.run(main())
+socket_owner_tests()
 shutil.rmtree(HOME, ignore_errors=True)
 shutil.rmtree(PLUGIN, ignore_errors=True)
 print(f"\n{PASS} passed, {FAIL} failed")
