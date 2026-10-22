@@ -2,8 +2,9 @@ use crate::memory_record::{MemoryRecord, VariableType};
 use crate::process::GameProcess;
 use crate::lua_engine::{ExecEnv, LuaAction, LuaCtx, LuaEngine, RecordView};
 use crate::symbol_handler::SymbolHandler;
-use http_body_util::Full;
+use http_body_util::{Full, Limited};
 use hyper::body::Bytes;
+use hyper::header::HeaderMap;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -228,15 +229,125 @@ pub fn apply_lua_actions(
 
 pub type SharedState = Arc<Mutex<RuntimeState>>;
 
+/// Environment variable the launcher uses to hand the trainer its API token.
+pub const API_TOKEN_ENV: &str = "HTT_API_TOKEN";
+/// Request header that carries the token.
+pub const API_TOKEN_HEADER: &str = "x-trainer-token";
+/// Largest request body accepted. The biggest legitimate body is a
+/// `/api/debug/write` of a few hundred bytes.
+const MAX_BODY_BYTES: usize = 1 << 20;
+
+/// Who may talk to the API.
+///
+/// The server only ever binds loopback, but loopback is reachable by every
+/// process on the machine *and* by any web page open in a browser on it: a
+/// page can `fetch("http://127.0.0.1:42069/api/debug/write", {method: "POST",
+/// body: "..."})` as a CORS "simple request" with no preflight, and the body
+/// is parsed as JSON whatever its Content-Type. Attach plus a memory write is
+/// code execution in the game's wine prefix - i.e. as the Deck user, since
+/// wine is not a sandbox and `Z:` is `/`. So every request has to prove it
+/// came from the launcher, and nothing a browser sends may get through:
+///
+/// - A request carrying an `Origin` header is a browser's, and is refused.
+/// - `Host` must name loopback (DNS rebinding points a real hostname at
+///   127.0.0.1 so the browser treats the page and the API as one origin).
+/// - When the launcher set `HTT_API_TOKEN`, the `X-Trainer-Token` header must
+///   match it. A custom header also forces a CORS preflight, which the
+///   server refuses, so a browser cannot even attempt an authenticated call.
+///
+/// Without a token (a trainer started by hand, the live test scripts) the
+/// Origin and Host checks still apply, and the start-up log says so.
+#[derive(Clone)]
+pub struct Gate {
+    token: Option<String>,
+    port: u16,
+}
+
+impl Gate {
+    pub fn from_env(port: u16) -> Self {
+        let token = std::env::var(API_TOKEN_ENV).ok().filter(|t| !t.is_empty());
+        Gate { token, port }
+    }
+
+    #[cfg(test)]
+    fn with_token(port: u16, token: Option<&str>) -> Self {
+        Gate { token: token.map(str::to_string), port }
+    }
+
+    pub fn enforces_token(&self) -> bool {
+        self.token.is_some()
+    }
+
+    /// Why a request is refused, or `Ok` to let it through.
+    fn check(&self, headers: &HeaderMap) -> Result<(), &'static str> {
+        if headers.contains_key("origin") {
+            return Err("cross-origin requests are not accepted");
+        }
+        let host = headers
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .ok_or("missing Host header")?;
+        if !self.host_is_loopback(host) {
+            return Err("Host is not the loopback address");
+        }
+        if let Some(expected) = &self.token {
+            let presented = headers
+                .get(API_TOKEN_HEADER)
+                .and_then(|h| h.to_str().ok())
+                .ok_or("missing X-Trainer-Token header")?;
+            if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+                return Err("bad X-Trainer-Token");
+            }
+        }
+        Ok(())
+    }
+
+    fn host_is_loopback(&self, host: &str) -> bool {
+        // `127.0.0.1:42069`, `localhost:42069`, `[::1]:42069`, or any of them
+        // without a port. Anything else - a real hostname, another port - is
+        // not a request the launcher would make.
+        let (name, port) = match host.rsplit_once(':') {
+            // `[::1]` has colons of its own; only a `]:` split is a port.
+            Some((n, p)) if !n.starts_with('[') || n.ends_with(']') => (n, Some(p)),
+            _ => (host, None),
+        };
+        let name_ok = matches!(name, "127.0.0.1" | "localhost" | "[::1]");
+        let port_ok = match port {
+            None => true,
+            Some(p) => p.parse::<u16>().ok() == Some(self.port),
+        };
+        name_ok && port_ok
+    }
+}
+
+/// Equal length and equal bytes, without an early exit on the first
+/// mismatch, so the comparison's timing says nothing about the token.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 pub async fn start_rest_server(port: u16, state: SharedState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(addr).await?;
-    info!("HATEOAS REST server listening on http://{}", addr);
+    let gate = Arc::new(Gate::from_env(port));
+    if gate.enforces_token() {
+        info!("HATEOAS REST server listening on http://{} (token required)", addr);
+    } else {
+        warn!(
+            "HATEOAS REST server listening on http://{} with NO token: {} is unset, so any \
+             local process can drive this trainer (browsers are still refused)",
+            addr, API_TOKEN_ENV
+        );
+    }
 
     loop {
         let (stream, _) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let state_clone = Arc::clone(&state);
+        let gate_clone = Arc::clone(&gate);
 
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new()
@@ -244,7 +355,8 @@ pub async fn start_rest_server(port: u16, state: SharedState) -> Result<(), Box<
                     io,
                     service_fn(move |req| {
                         let state = Arc::clone(&state_clone);
-                        async move { handle_request(req, state).await }
+                        let gate = Arc::clone(&gate_clone);
+                        async move { handle_request(req, state, gate).await }
                     }),
                 )
                 .await
@@ -276,19 +388,27 @@ fn find_record_mut<'a>(records: &'a mut [MemoryRecord], id: Option<u32>, desc: O
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     state: SharedState,
+    gate: Arc<Gate>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if let Err(why) = gate.check(req.headers()) {
+        warn!("refused {} {}: {}", req.method(), req.uri().path(), why);
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({ "error": why }).to_string(),
+        ));
+    }
+
     let method = req.method();
     let path = req.uri().path();
 
-    // CORS preflight
+    // No CORS, by design: the only client is the launcher's proxy, which is
+    // not a browser. A preflight is a browser asking permission, and the
+    // answer is no (see `Gate`).
     if method == Method::OPTIONS {
-        return Ok(Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            .header("Access-Control-Allow-Headers", "Content-Type")
-            .body(Full::new(Bytes::from("")))
-            .unwrap());
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"cross-origin requests are not accepted"}"#,
+        ));
     }
 
     match (method, path) {
@@ -918,9 +1038,12 @@ fn build_features_json(state: &RuntimeState) -> serde_json::Value {
     })
 }
 
-async fn read_body(req: Request<hyper::body::Incoming>) -> Result<Vec<u8>, hyper::Error> {
+/// The body, or an error once it exceeds `MAX_BODY_BYTES`. Every caller
+/// already answers 400 on error, which is the right reply to an oversized
+/// body too.
+async fn read_body(req: Request<hyper::body::Incoming>) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     use http_body_util::BodyExt;
-    let bytes = req.into_body().collect().await?.to_bytes();
+    let bytes = Limited::new(req.into_body(), MAX_BODY_BYTES).collect().await?.to_bytes();
     Ok(bytes.to_vec())
 }
 
@@ -928,7 +1051,6 @@ fn json_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json; charset=utf-8")
-        .header("Access-Control-Allow-Origin", "*")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap()
 }
@@ -984,6 +1106,95 @@ fn deactivate_recursive(
             Ok(()) => off.push(rec.description.clone()),
             Err(e) => failed.push(format!("{}: {}", rec.description, e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use hyper::header::{HeaderName, HeaderValue};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(HeaderName::from_bytes(k.as_bytes()).unwrap(), HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    /// What the launcher's proxy sends: loopback Host, the token, no Origin.
+    #[test]
+    fn the_launchers_request_is_accepted() {
+        let gate = Gate::with_token(42069, Some("s3cret"));
+        let h = headers(&[("host", "127.0.0.1:42069"), ("x-trainer-token", "s3cret")]);
+        assert_eq!(gate.check(&h), Ok(()));
+        // Header names are case-insensitive; the proxy spells it in title case.
+        let h = headers(&[("Host", "localhost:42069"), ("X-Trainer-Token", "s3cret")]);
+        assert_eq!(gate.check(&h), Ok(()));
+    }
+
+    /// A browser always sends Origin on a cross-origin fetch, and that alone
+    /// is disqualifying - token or no token.
+    #[test]
+    fn anything_with_an_origin_is_refused() {
+        let gate = Gate::with_token(42069, Some("s3cret"));
+        let h = headers(&[
+            ("host", "127.0.0.1:42069"),
+            ("origin", "https://example.com"),
+            ("x-trainer-token", "s3cret"),
+        ]);
+        assert!(gate.check(&h).is_err());
+        let open = Gate::with_token(42069, None);
+        let h = headers(&[("host", "127.0.0.1:42069"), ("origin", "null")]);
+        assert!(open.check(&h).is_err());
+    }
+
+    /// DNS rebinding: a page on `evil.example` whose name now resolves to
+    /// 127.0.0.1 sends `Host: evil.example:42069` and no Origin.
+    #[test]
+    fn a_rebound_host_is_refused() {
+        let gate = Gate::with_token(42069, None);
+        for host in ["evil.example:42069", "evil.example", "127.0.0.1:8080", "10.0.0.5:42069", ""] {
+            let h = headers(&[("host", host)]);
+            assert!(gate.check(&h).is_err(), "{:?} must be refused", host);
+        }
+        for host in ["127.0.0.1:42069", "127.0.0.1", "localhost", "localhost:42069", "[::1]:42069", "[::1]"] {
+            let h = headers(&[("host", host)]);
+            assert_eq!(gate.check(&h), Ok(()), "{:?} must be accepted", host);
+        }
+        assert!(gate.check(&headers(&[])).is_err(), "no Host at all is refused");
+    }
+
+    #[test]
+    fn the_token_is_required_and_compared_exactly() {
+        let gate = Gate::with_token(42069, Some("s3cret"));
+        let no_token = headers(&[("host", "127.0.0.1:42069")]);
+        assert!(gate.check(&no_token).is_err());
+        for bad in ["s3cre", "s3cret ", "S3CRET", "", "s3cretx"] {
+            let h = headers(&[("host", "127.0.0.1:42069"), ("x-trainer-token", bad)]);
+            assert!(gate.check(&h).is_err(), "{:?} must be refused", bad);
+        }
+    }
+
+    /// A hand-launched trainer has no token and still answers its own tools.
+    #[test]
+    fn without_a_configured_token_none_is_asked_for() {
+        let gate = Gate::with_token(42069, None);
+        assert!(!gate.enforces_token());
+        assert_eq!(gate.check(&headers(&[("host", "127.0.0.1:42069")])), Ok(()));
+        // An empty HTT_API_TOKEN means "none", not "the empty string".
+        std::env::set_var(API_TOKEN_ENV, "");
+        assert!(!Gate::from_env(42069).enforces_token());
+        std::env::remove_var(API_TOKEN_ENV);
+    }
+
+    #[test]
+    fn constant_time_eq_is_exact() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
     }
 }
 

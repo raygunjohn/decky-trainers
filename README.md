@@ -109,7 +109,10 @@ Deck (Linux)                          Game's Proton prefix (Windows)
    PE** — the trainer runtime with the table appended as an overlay.
 2. `main.py` launches that `.exe` through the game's own `wine` and prefix.
 3. The trainer parses the table, runs its Lua, injects, and serves a REST API on
-   `127.0.0.1:42069`.
+   `127.0.0.1:42069`. The API answers only to the plugin: every request must
+   carry the token the plugin issued for that launch, and anything a browser
+   could send (an `Origin` header, a non-loopback `Host`) is refused outright,
+   since the API can read and write the game's memory.
 4. The QAM panel renders that API's feature tree and posts back toggles.
 
 ## Limitations

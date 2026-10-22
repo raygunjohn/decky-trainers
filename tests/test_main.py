@@ -7,6 +7,7 @@ import shutil
 import sys
 import tempfile
 import types
+import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOME = tempfile.mkdtemp(prefix="deck-home-")
@@ -34,6 +35,7 @@ import remote  # noqa: E402
 import library  # noqa: E402
 import generate as generate_mod  # noqa: E402
 from main import Plugin  # noqa: E402
+import main as main_mod  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -242,7 +244,64 @@ async def main():
     check("listing cache gone too, refetches", listing["cached"], False)
 
 
+def api_token_tests():
+    section("API token")
+    env = {"WINEPREFIX": "/x"}
+    token = main_mod.issue_api_token(env)
+    check("token is long enough", len(token) >= 40, True)
+    check("token lands in the trainer env", env[main_mod.API_TOKEN_ENV], token)
+    check("game env untouched otherwise", env["WINEPREFIX"], "/x")
+    check("tokens are unique per launch", main_mod.issue_api_token({}) != token, True)
+
+    # http_json sends the header, and only when it has a token.
+    captured = []
+
+    class FakeResponse:
+        status = 200
+
+        def read(self):
+            return b'{"ok": true}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        captured.append(request)
+        return FakeResponse()
+
+    saved = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        main_mod.http_json("GET", "http://127.0.0.1:1/api/features", None, 1.0, "tok-123")
+        check("header sent", captured[-1].get_header("X-trainer-token"), "tok-123")
+        main_mod.http_json("POST", "http://127.0.0.1:1/api/x", {"a": 1}, 1.0, "")
+        check("no header without a token", captured[-1].get_header("X-trainer-token"), None)
+        check("still no Origin header", captured[-1].get_header("Origin"), None)
+    finally:
+        urllib.request.urlopen = saved
+
+    # The token survives a plugin restart via the runtime dir, and a reset
+    # removes it.
+    plugin = Plugin()
+    plugin.settings = {}
+    plugin.proc = None
+    plugin._save_token("persisted")
+    mode = os.stat(plugin._token_path()).st_mode & 0o777
+    check("token file is owner-only", oct(mode), oct(0o600))
+    fresh = Plugin()
+    fresh.settings = {}
+    check("a new instance reads the token back", fresh._load_token(), "persisted")
+    plugin._reset_trainer_state()
+    check("reset clears the token", plugin.api_token, "")
+    check("reset removes the file", os.path.exists(plugin._token_path()), False)
+    check("missing file reads as no token", fresh._load_token(), "")
+
+
 asyncio.run(main())
+api_token_tests()
 shutil.rmtree(HOME, ignore_errors=True)
 shutil.rmtree(PLUGIN, ignore_errors=True)
 print(f"\n{PASS} passed, {FAIL} failed")

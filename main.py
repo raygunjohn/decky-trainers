@@ -21,6 +21,7 @@ Stdlib only — nothing to pip install on the Deck.
 import asyncio
 import json
 import os
+import secrets
 import signal
 import subprocess
 import time
@@ -350,10 +351,34 @@ def socket_owner_pids(port: int):
 # ------------------------------------------------------------------ HTTP (sync)
 
 
-def http_json(method: str, url: str, body=None, timeout: float = 10.0):
-    """Blocking JSON request. Returns (status, parsed_body_or_text)."""
+API_TOKEN_ENV = "HTT_API_TOKEN"
+API_TOKEN_HEADER = "X-Trainer-Token"
+
+
+def issue_api_token(env: dict) -> str:
+    """A fresh token for one trainer launch, placed in the trainer's `env`.
+
+    The trainer binds loopback only, but loopback is reachable by every
+    process on the Deck and by any web page open in a browser on it, and the
+    API can attach to and write the game's memory. The trainer therefore
+    refuses any request without this token (see `Gate` in rest_server.rs),
+    and only this plugin ever has it.
+    """
+    token = secrets.token_urlsafe(32)
+    env[API_TOKEN_ENV] = token
+    return token
+
+
+def http_json(method: str, url: str, body=None, timeout: float = 10.0, token: str = ""):
+    """Blocking JSON request. Returns (status, parsed_body_or_text).
+
+    `token` goes out as `X-Trainer-Token`; without it a launched trainer
+    answers 403 to everything.
+    """
     data = None
     headers = {"Accept": "application/json"}
+    if token:
+        headers[API_TOKEN_HEADER] = token
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -391,6 +416,10 @@ class Plugin:
         self.game_exe = ""
         self.adopted = False
         self.sidecar_process = ""
+        # A trainer launched by a previous plugin instance (Decky restarted
+        # under it) is still answering only to the token that instance
+        # issued, so the token outlives the instance on disk.
+        self.api_token = self._load_token()
 
         try:
             os.makedirs(self._trainer_dir(), exist_ok=True)
@@ -458,6 +487,40 @@ class Plugin:
 
     def _base_url(self) -> str:
         return f"http://127.0.0.1:{self._port()}"
+
+    # -- API token -------------------------------------------------------------
+
+    def _token_path(self) -> str:
+        return os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "api-token")
+
+    def _load_token(self) -> str:
+        try:
+            with open(self._token_path(), "r") as handle:
+                return handle.read().strip()
+        except OSError:
+            return ""
+
+    def _save_token(self, token: str) -> None:
+        """Owner-readable only. Anything running as this user could read it,
+        but that is also anything that could ptrace the trainer; the point is
+        to keep it from browsers and from other users."""
+        path = self._token_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(token)
+        except OSError as error:
+            decky.logger.warning(f"{LOG} could not persist the API token: {error}")
+
+    def _clear_token(self) -> None:
+        self.api_token = ""
+        try:
+            os.remove(self._token_path())
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            decky.logger.warning(f"{LOG} could not remove the API token file: {error}")
 
     async def get_settings(self):
         return dict(self.settings)
@@ -865,6 +928,11 @@ class Plugin:
         if env_error:
             return {"ok": False, "error": env_error}
 
+        # Issued per launch and handed over in the environment; never on the
+        # command line, where any user's `ps` would show it.
+        self.api_token = issue_api_token(env)
+        self._save_token(self.api_token)
+
         decky.logger.info(
             f"{LOG} launching {trainer_path} via {wine} in prefix "
             f"{env.get('WINEPREFIX')} (game {exe_name}, pid {pid}, uid {os.geteuid()})"
@@ -912,7 +980,8 @@ class Plugin:
     async def _api_up(self, timeout: float = 2.0) -> bool:
         try:
             status, _ = await asyncio.to_thread(
-                http_json, "GET", f"{self._base_url()}/api/features", None, timeout
+                http_json, "GET", f"{self._base_url()}/api/features", None, timeout,
+                self.api_token,
             )
             return status < 500
         except Exception:
@@ -935,7 +1004,8 @@ class Plugin:
         status, payload = None, None
         try:
             status, payload = await asyncio.to_thread(
-                http_json, "GET", f"{self._base_url()}/api/features", None, 2.0
+                http_json, "GET", f"{self._base_url()}/api/features", None, 2.0,
+                self.api_token,
             )
         except Exception:
             pass
@@ -1009,7 +1079,8 @@ class Plugin:
         if api_up:
             try:
                 status, payload = await asyncio.to_thread(
-                    http_json, "GET", f"{self._base_url()}/api/features", None, 3.0
+                    http_json, "GET", f"{self._base_url()}/api/features", None, 3.0,
+                    self.api_token,
                 )
                 if status < 400 and isinstance(payload, dict):
                     process_block = payload.get("process") or {}
@@ -1085,6 +1156,7 @@ class Plugin:
         try:
             status, payload = await asyncio.to_thread(
                 http_json, "POST", f"{self._base_url()}/api/shutdown", {}, ACTION_TIMEOUT,
+                self.api_token,
             )
             if status < 400 and isinstance(payload, dict):
                 unhooked = payload.get("deactivated", 0)
@@ -1186,6 +1258,7 @@ class Plugin:
         self.game_exe = ""
         self.adopted = False
         self.sidecar_process = ""
+        self._clear_token()
 
     # -- API proxy -----------------------------------------------------------
 
@@ -1198,7 +1271,7 @@ class Plugin:
         timeout = READ_TIMEOUT if method == "GET" else ACTION_TIMEOUT
         try:
             status, payload = await asyncio.to_thread(
-                http_json, method, url, body, timeout
+                http_json, method, url, body, timeout, self.api_token
             )
         except Exception as error:
             decky.logger.error(f"{LOG} api_request {method} {path} failed: {error}")
