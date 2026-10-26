@@ -25,7 +25,25 @@ use super::{Attached, ModuleInfo, ProcessBackend, Region};
 pub struct WindowsBackend {
     pid: u32,
     handle: HANDLE,
+    /// A 32-bit target. Its module list has to come from its 32-bit PEB:
+    /// see `enumerate_modules`.
+    is_wow64: bool,
 }
+
+// `ProcessWow64Information`: the 32-bit PEB address of a WoW64 process,
+// zero for a native one. Declared here rather than through the `windows`
+// crate's `Wdk` feature set, since this is the only NT API the backend uses.
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryInformationProcess(
+        process: HANDLE,
+        class: u32,
+        info: *mut std::ffi::c_void,
+        len: u32,
+        return_len: *mut u32,
+    ) -> i32;
+}
+const PROCESS_WOW64_INFORMATION: u32 = 26;
 
 // HANDLE is a raw pointer, so it is neither Send nor Sync by inference. The
 // handle is only ever passed to Win32 calls that are themselves thread-safe,
@@ -65,7 +83,7 @@ pub fn attach_by_name(process_name: &str) -> Result<Attached> {
         let _ = IsWow64Process(handle, &mut is_wow64 as *mut bool as *mut _);
 
         Ok(Attached {
-            backend: Box::new(WindowsBackend { pid, handle }),
+            backend: Box::new(WindowsBackend { pid, handle, is_wow64 }),
             pid,
             is_64bit: !is_wow64,
         })
@@ -242,7 +260,46 @@ impl ProcessBackend for WindowsBackend {
     }
 
     fn enumerate_modules(&self) -> Result<HashMap<String, ModuleInfo>> {
-        unsafe {
+        // Toolhelp cannot snapshot a WoW64 target's modules from a 64-bit
+        // caller: it fails with ERROR_PARTIAL_COPY, which is what used to
+        // kill every attach to a 32-bit game. The 32-bit PEB has the list
+        // the table wants anyway (the 32-bit kernel32, not the 64-bit one).
+        if self.is_wow64 {
+            match self.modules_via_peb32() {
+                Ok(m) if !m.is_empty() => return Ok(m),
+                Ok(_) => tracing::warn!("the 32-bit loader list is empty; trying Toolhelp"),
+                Err(e) => tracing::warn!("32-bit loader walk failed ({:#}); trying Toolhelp", e),
+            }
+        }
+        unsafe { self.modules_via_toolhelp() }
+    }
+}
+
+impl WindowsBackend {
+    fn modules_via_peb32(&self) -> Result<HashMap<String, ModuleInfo>> {
+        let mut peb32: usize = 0;
+        let mut len = 0u32;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                self.handle,
+                PROCESS_WOW64_INFORMATION,
+                &mut peb32 as *mut usize as *mut std::ffi::c_void,
+                std::mem::size_of::<usize>() as u32,
+                &mut len,
+            )
+        };
+        if status < 0 {
+            bail!("NtQueryInformationProcess(ProcessWow64Information) failed: NTSTATUS {:#X}", status);
+        }
+        if peb32 == 0 {
+            bail!("the target reports no 32-bit PEB, so it is not a WoW64 process");
+        }
+        let read = |addr: usize, buf: &mut [u8]| self.read(addr, buf);
+        super::peb32::modules_from_peb32(&read, peb32)
+    }
+
+    unsafe fn modules_via_toolhelp(&self) -> Result<HashMap<String, ModuleInfo>> {
+        {
             let mut modules = HashMap::new();
             let snapshot =
                 CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, self.pid)?;

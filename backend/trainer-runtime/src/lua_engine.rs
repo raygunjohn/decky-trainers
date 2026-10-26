@@ -509,7 +509,6 @@ impl LuaEngine {
         reader!("readWord", 2, |b: [u8; 2]| i16::from_le_bytes(b) as i64);
         reader!("readByte", 1, |b: [u8; 1]| b[0] as i64);
         reader!("readQword", 8, |b: [u8; 8]| i64::from_le_bytes(b));
-        reader!("readPointer", 8, |b: [u8; 8]| i64::from_le_bytes(b));
         reader!("readFloat", 4, |b: [u8; 4]| f32::from_le_bytes(b) as f64);
         reader!("readDouble", 8, |b: [u8; 8]| f64::from_le_bytes(b));
 
@@ -538,7 +537,54 @@ impl LuaEngine {
         writer!("writeWord", i16, |v: i16| v.to_le_bytes().to_vec());
         writer!("writeByte", u8, |v: u8| vec![v]);
         writer!("writeQword", i64, |v: i64| v.to_le_bytes().to_vec());
-        writer!("writePointer", i64, |v: i64| v.to_le_bytes().to_vec());
+
+        // ---- pointer-width access -------------------------------------
+        // A pointer is 8 bytes in a 64-bit target and 4 in a WoW64 one;
+        // reading 8 from a 32-bit game pulls in whatever follows the pointer.
+        let s = Arc::clone(shared);
+        g.set(
+            "readPointer",
+            lua.create_function(move |_, addr: Value| {
+                let b = s.lock().unwrap();
+                let p = b.proc()?;
+                let a = resolve_addr(&addr, Some(p), b.syms()?)?;
+                if p.is_64bit {
+                    let mut buf = [0u8; 8];
+                    p.read_memory(a, &mut buf).map_err(mlua::Error::external)?;
+                    Ok(i64::from_le_bytes(buf))
+                } else {
+                    let mut buf = [0u8; 4];
+                    p.read_memory(a, &mut buf).map_err(mlua::Error::external)?;
+                    Ok(u32::from_le_bytes(buf) as i64)
+                }
+            })?,
+        )?;
+        let s = Arc::clone(shared);
+        g.set(
+            "writePointer",
+            lua.create_function(move |_, (addr, v): (Value, f64)| {
+                let b = s.lock().unwrap();
+                let p = b.proc()?;
+                let a = resolve_addr(&addr, Some(p), b.syms()?)?;
+                let bytes = if p.is_64bit {
+                    (v as i64).to_le_bytes().to_vec()
+                } else {
+                    (v as i64 as u32).to_le_bytes().to_vec()
+                };
+                p.write_memory(a, &bytes).map_err(mlua::Error::external)?;
+                Ok(true)
+            })?,
+        )?;
+        // targetIs64Bit(): tables branch on this to pick a pointer width or
+        // a script variant.
+        let s = Arc::clone(shared);
+        g.set(
+            "targetIs64Bit",
+            lua.create_function(move |_, ()| {
+                let b = s.lock().unwrap();
+                Ok(b.proc()?.is_64bit)
+            })?,
+        )?;
         writer!("writeFloat", f32, |v: f32| v.to_le_bytes().to_vec());
         writer!("writeDouble", f64, |v: f64| v.to_le_bytes().to_vec());
 

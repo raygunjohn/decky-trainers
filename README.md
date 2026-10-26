@@ -116,7 +116,10 @@ Deck (Linux)                          Game's Proton prefix (Windows)
 
 - **Single-player games only**
 - **One trainer at a time**
-- **x86-64 only**
+- **Windows (Proton) games only.** The trainer is a Windows program that joins
+  the game's wine session; a native Linux game has no such session to join.
+  Both 64-bit and 32-bit Windows games work: the same trainer detects a WoW64
+  game when it attaches and assembles 32-bit code for it.
 - **Global hotkeys from a table do not fire.** (todo)
 
 ## License
