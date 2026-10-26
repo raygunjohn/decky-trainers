@@ -147,7 +147,10 @@ impl Insn {
     fn emit(&self, addr: u64) -> Result<Vec<u8>> {
         // VEX replaces both the legacy prefixes and REX.
         if let Some(vex) = self.vex {
-            if self.mode == Mode::Bits32 && (self.rex_r || self.rex_x || self.rex_b || vex.w) {
+            // The VEX.vvvv source does not set any REX extension flags.
+            if self.mode == Mode::Bits32
+                && (self.rex_r || self.rex_x || self.rex_b || vex.w || vex.vvvv >= 8)
+            {
                 bail!("xmm8-15 and 64-bit operands do not exist in 32-bit mode");
             }
             let mut v = Vec::new();
@@ -2312,6 +2315,14 @@ mod tests {
     }
 
     #[test]
+    fn vex_extended_sources_remain_valid_in_64bit_mode() {
+        assert_eq!(asm("vaddss xmm0,xmm8,xmm1"), vec![0xC5, 0xBA, 0x58, 0xC1]);
+        assert_eq!(asm("vaddss xmm0,xmm15,xmm1"), vec![0xC5, 0x82, 0x58, 0xC1]);
+        assert_eq!(asm("vshufps xmm0,xmm8,xmm1,4E"), vec![0xC5, 0xB8, 0xC6, 0xC1, 0x4E]);
+        assert_eq!(asm("vshufps xmm0,xmm15,xmm1,4E"), vec![0xC5, 0x80, 0xC6, 0xC1, 0x4E]);
+    }
+
+    #[test]
     fn misc_and_string_instructions() {
         assert_eq!(asm("cld"), vec![0xFC]);
         assert_eq!(asm("sahf"), vec![0x9E]);
@@ -2616,6 +2627,32 @@ mod bits32_tests {
         assert_eq!(ok32("mov ah,al"), vec![0x88, 0xC4]);
         // An absolute address above 4GB cannot belong to a 32-bit process.
         assert!(asm32("mov eax,[big]", 0x0040_1000, &[("big", 0x1_0000_0000)]).is_err());
+    }
+
+    #[test]
+    fn vex_extended_registers_are_rejected() {
+        for reg in 8..=15 {
+            for line in [
+                format!("vaddss xmm{reg},xmm1,xmm2"),
+                format!("vaddss xmm0,xmm{reg},xmm2"),
+                format!("vaddss xmm0,xmm1,xmm{reg}"),
+                format!("vaddss xmm0,xmm{reg},[eax]"),
+                format!("vshufps xmm{reg},xmm1,xmm2,4E"),
+                format!("vshufps xmm0,xmm{reg},xmm2,4E"),
+                format!("vshufps xmm0,xmm1,xmm{reg},4E"),
+                format!("vshufps xmm0,xmm{reg},[eax],4E"),
+            ] {
+                assert!(asm32(&line, 0x0040_1000, &[]).is_err(), "{} must be rejected", line);
+            }
+        }
+    }
+
+    #[test]
+    fn vex_low_sources_remain_valid() {
+        assert_eq!(ok32("vaddss xmm0,xmm0,xmm1"), vec![0xC5, 0xFA, 0x58, 0xC1]);
+        assert_eq!(ok32("vaddss xmm0,xmm7,xmm1"), vec![0xC5, 0xC2, 0x58, 0xC1]);
+        assert_eq!(ok32("vshufps xmm0,xmm0,xmm1,4E"), vec![0xC5, 0xF8, 0xC6, 0xC1, 0x4E]);
+        assert_eq!(ok32("vshufps xmm0,xmm7,xmm1,4E"), vec![0xC5, 0xC0, 0xC6, 0xC1, 0x4E]);
     }
 
     /// The default mode is unchanged: every existing 64-bit caller keeps the
