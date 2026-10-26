@@ -107,13 +107,33 @@ WINE_SYSTEM_EXES = {
 # ---------------------------------------------------------------- /proc helpers
 
 
-def iter_pids():
+def iter_pids(proc: str = "/proc"):
     try:
-        for entry in os.listdir("/proc"):
+        for entry in os.listdir(proc):
             if entry.isdigit():
                 yield entry
     except OSError:
         return
+
+
+def is_wineserver(pid, proc: str = "/proc") -> bool:
+    """True for a wineserver.
+
+    A wineserver holds a duplicate of every handle of every wine process it
+    serves, the trainer's listening socket included, so a scan for the
+    socket's owners finds the wineserver next to the trainer. The game's
+    wineserver is the *game's* whole session: signalling it hangs the game.
+    """
+    try:
+        with open(f"{proc}/{pid}/comm", "r") as handle:
+            if handle.read().strip() == "wineserver":
+                return True
+    except OSError:
+        pass
+    try:
+        return os.path.basename(os.readlink(f"{proc}/{pid}/exe")) == "wineserver"
+    except OSError:
+        return False
 
 
 def read_environ(pid: str) -> dict:
@@ -127,6 +147,15 @@ def read_environ(pid: str) -> dict:
         if sep:
             env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
     return env
+
+
+def wine_path_to_unix(path: str) -> str:
+    """`Z:\\home\\deck\\x.exe` -> `/home/deck/x.exe`; any other drive letter is
+    left as a Windows path (only the name is useful then)."""
+    unix = path.replace("\\", "/")
+    if unix[:2].upper() == "Z:":
+        return unix[2:] or "/"
+    return unix
 
 
 def read_cmdline(pid: str) -> list:
@@ -311,10 +340,17 @@ def wine_env_for(env: dict):
     return env, None
 
 
-def socket_owner_pids(port: int):
-    """PIDs owning a LISTEN socket on 127.0.0.1:<port>, via /proc/net/tcp."""
+def socket_owner_pids(port: int, proc: str = "/proc"):
+    """PIDs owning a LISTEN socket on 127.0.0.1:<port>, via /proc/net/tcp.
+
+    Never the wineserver, even though it holds the socket too (see
+    `is_wineserver`). Adopting it as "the trainer" once ended with the plugin
+    SIGTERMing the game's wineserver after the trainer had already exited,
+    which froze the game and left the next trainer in an empty wine session
+    where no game process could be found.
+    """
     inodes = set()
-    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+    for path in (f"{proc}/net/tcp", f"{proc}/net/tcp6"):
         try:
             with open(path, "r") as handle:
                 next(handle, None)  # header
@@ -332,8 +368,10 @@ def socket_owner_pids(port: int):
 
     owners = []
     targets = {f"socket:[{inode}]" for inode in inodes}
-    for pid in iter_pids():
-        fd_dir = f"/proc/{pid}/fd"
+    for pid in iter_pids(proc):
+        if is_wineserver(pid, proc):
+            continue
+        fd_dir = f"{proc}/{pid}/fd"
         try:
             for fd in os.listdir(fd_dir):
                 try:
@@ -975,19 +1013,28 @@ class Plugin:
     def _adopt_from_socket(self):
         """Learn the name and path of a trainer we did not launch (blocking).
 
-        The port's owner *is* the trainer, so `/proc/<pid>/exe` answers this
-        outright — argv[0] is only a fallback, since a trainer started from a
-        shell can carry a relative path there.
+        The port's owner *is* the trainer. Under Proton it is a wine process,
+        so `/proc/<pid>/exe` is the wine preloader and argv[0] is the trainer
+        as wine spells it (`Z:\\home\\deck\\trainers\\X.exe`); that is the name
+        the rest of the plugin matches processes by. `exe` is the fallback for
+        a trainer that is not running under wine.
         """
         for pid in socket_owner_pids(self._port()):
             path = ""
+            cmdline = []
             try:
-                path = os.readlink(f"/proc/{pid}/exe")
+                cmdline = read_cmdline(pid)
             except OSError:
                 pass
+            if cmdline and cmdline[0].lower().endswith(".exe"):
+                path = wine_path_to_unix(cmdline[0])
             if not path:
-                cmdline = read_cmdline(pid)
-                path = os.path.realpath(cmdline[0]) if cmdline else ""
+                try:
+                    path = os.readlink(f"/proc/{pid}/exe")
+                except OSError:
+                    pass
+            if not path and cmdline:
+                path = os.path.realpath(cmdline[0])
             if not path:
                 continue
 
