@@ -278,6 +278,19 @@ def socket_owner_tests():
     check("trainer is not a wineserver", main_mod.is_wineserver("100", proc), False)
     check("unknown pid is not a wineserver", main_mod.is_wineserver("999", proc), False)
     check("other ports have no owners", main_mod.socket_owner_pids(1, proc=proc), [])
+
+    # Linux truncates comm to 15 bytes, which can split a UTF-8 character.
+    # An unrelated process must not prevent us from finding the trainer.
+    os.makedirs(os.path.join(proc, "300", "fd"))
+    with open(os.path.join(proc, "300", "comm"), "wb") as handle:
+        handle.write("background-proé".encode("utf-8")[:15] + b"\n")
+    check("truncated UTF-8 comm does not abort the socket scan",
+          main_mod.socket_owner_pids(42069, proc=proc), ["100"])
+    check("unrelated process with truncated comm is not a wineserver",
+          main_mod.is_wineserver("300", proc), False)
+    os.symlink("/opt/proton/bin/wineserver", os.path.join(proc, "300", "exe"))
+    check("truncated comm still allows wineserver detection by exe",
+          main_mod.is_wineserver("300", proc), True)
     shutil.rmtree(proc, ignore_errors=True)
 
     check("Z: maps to /", main_mod.wine_path_to_unix("Z:\\home\\deck\\t\\X.exe"), "/home/deck/t/X.exe")

@@ -125,8 +125,9 @@ def is_wineserver(pid, proc: str = "/proc") -> bool:
     wineserver is the *game's* whole session: signalling it hangs the game.
     """
     try:
-        with open(f"{proc}/{pid}/comm", "r") as handle:
-            if handle.read().strip() == "wineserver":
+        # comm is byte-limited and can contain a truncated UTF-8 character.
+        with open(f"{proc}/{pid}/comm", "rb") as handle:
+            if handle.read().strip() == b"wineserver":
                 return True
     except OSError:
         pass
