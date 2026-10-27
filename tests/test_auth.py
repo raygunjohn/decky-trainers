@@ -133,6 +133,17 @@ class PluginAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], 302)
 
+    async def test_oversized_proxy_action_returns_413_without_network_io(self):
+        with patch.object(main.urllib.request, "build_opener") as opener:
+            result = await self.plugin.api_request(
+                "POST", "/api/features/toggle",
+                {"description": "x" * main.MAX_REQUEST_BODY_BYTES},
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 413)
+        self.assertEqual(result["error"], "Request body exceeds 1 MiB limit")
+        opener.assert_not_called()
+
     async def test_launch_passes_secret_and_selected_port_to_child(self):
         trainer = Path(self.temp.name) / "test.exe"
         trainer.write_bytes(b"MZ")
@@ -203,6 +214,42 @@ class TransportTests(unittest.TestCase):
         status, _ = main.http_json("GET", self.base + "/redirect", auth_secret="a" * 64)
         self.assertEqual(status, 302)
         self.assertEqual(len(self.calls), 1)
+
+    def test_serialized_body_one_byte_over_limit_is_rejected_without_network_io(self):
+        body = "x" * (main.MAX_REQUEST_BODY_BYTES - 1)
+        self.assertEqual(len(json.dumps(body).encode("utf-8")), main.MAX_REQUEST_BODY_BYTES + 1)
+        with patch.object(main.urllib.request, "build_opener") as opener:
+            status, payload = main.http_json("POST", self.base + "/api/features/toggle",
+                                             body, auth_secret="a" * 64)
+        self.assertEqual(status, 413)
+        self.assertEqual(payload, {"error": "Request body exceeds 1 MiB limit"})
+        opener.assert_not_called()
+
+    def test_serialized_body_at_limit_is_sent_without_alteration(self):
+        body = "x" * (main.MAX_REQUEST_BODY_BYTES - 2)
+        serialized = json.dumps(body).encode("utf-8")
+        self.assertEqual(len(serialized), main.MAX_REQUEST_BODY_BYTES)
+        with patch.object(main.urllib.request, "build_opener") as builder:
+            opener = builder.return_value
+            response = opener.open.return_value.__enter__.return_value
+            response.status = 200
+            response.read.return_value = b'{"ok":true}'
+            status, payload = main.http_json("POST", self.base + "/api/features/toggle",
+                                             body, auth_secret="a" * 64)
+        self.assertEqual((status, payload), (200, {"ok": True}))
+        opener.open.assert_called_once()
+        self.assertEqual(opener.open.call_args.args[0].data, serialized)
+
+    def test_body_limit_counts_serialized_unicode_bytes_not_characters(self):
+        body = "\u00e9" * (main.MAX_REQUEST_BODY_BYTES // 6 + 1)
+        self.assertLess(len(body), main.MAX_REQUEST_BODY_BYTES)
+        self.assertGreater(len(json.dumps(body).encode("utf-8")), main.MAX_REQUEST_BODY_BYTES)
+        with patch.object(main.urllib.request, "build_opener") as opener:
+            status, payload = main.http_json("POST", self.base + "/api/features/toggle",
+                                             body, auth_secret="a" * 64)
+        self.assertEqual(status, 413)
+        self.assertEqual(payload, {"error": "Request body exceeds 1 MiB limit"})
+        opener.assert_not_called()
 
     def test_launch_rejects_authentication_failure_without_spawning(self):
         plugin = main.Plugin()

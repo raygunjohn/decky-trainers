@@ -52,6 +52,7 @@ SHUTDOWN_GRACE_TICKS = 12  # 6s
 # and invited a kill that risks the game.
 READ_TIMEOUT = 15.0
 ACTION_TIMEOUT = 120.0
+MAX_REQUEST_BODY_BYTES = 1024 * 1024
 
 DEFAULT_PORT = 42069
 DEFAULT_TRAINER_DIR = os.path.join(decky.DECKY_USER_HOME, "trainers")
@@ -413,6 +414,8 @@ def http_json(method: str, url: str, body=None, timeout: float = 10.0,
     headers = {"Accept": "application/json", "Authorization": f"Bearer {auth_secret}"}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
+        if len(data) > MAX_REQUEST_BODY_BYTES:
+            return 413, {"error": "Request body exceeds 1 MiB limit"}
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
