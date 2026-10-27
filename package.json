@@ -1,6 +1,6 @@
 {
   "name": "decky-trainers",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Decky plugin that launches cheat trainers inside the running game's Proton prefix and drives their HATEOAS REST API from the Quick Access Menu",
   "type": "module",
   "scripts": {
