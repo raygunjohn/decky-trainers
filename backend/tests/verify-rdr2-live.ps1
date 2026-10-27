@@ -17,6 +17,10 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $trainer = Join-Path $root 'dist\rdr2_trainer.exe'
 $api = 'http://127.0.0.1:42069'
+if ($env:DECKY_TRAINER_SECRET -cnotmatch '^[0-9a-f]{64}$') {
+    throw 'Set DECKY_TRAINER_SECRET to 64 lowercase hex characters before running this test.'
+}
+$authHeaders = @{ Authorization = "Bearer $env:DECKY_TRAINER_SECRET" }
 
 function Fail($m) { Write-Host "FAIL  $m" -ForegroundColor Red }
 function Pass($m) { Write-Host "PASS  $m" -ForegroundColor Green }
@@ -26,20 +30,20 @@ function Head($m) { Write-Host "`n== $m" -ForegroundColor Cyan }
 function Toggle($desc) {
     $body = @{ description = $desc; active = $true } | ConvertTo-Json -Compress
     try {
-        Invoke-RestMethod -Uri "$api/api/features/toggle" -Method Post `
+        Invoke-RestMethod -Headers $authHeaders -Uri "$api/api/features/toggle" -Method Post `
             -ContentType 'application/json' -Body $body -TimeoutSec 120
     } catch { @{ error = $_.Exception.Message } }
 }
 function DebugRead($expr, $size) {
     $e = [uri]::EscapeDataString($expr)
-    try { Invoke-RestMethod -Uri "$api/api/debug/read?expr=$e&size=$size" -TimeoutSec 10 }
+    try { Invoke-RestMethod -Headers $authHeaders -Uri "$api/api/debug/read?expr=$e&size=$size" -TimeoutSec 10 }
     catch { $null }
 }
 function Flatten($nodes) {
     foreach ($n in $nodes) { $n; if ($n.children) { Flatten $n.children } }
 }
 function Coords() {
-    $f = Invoke-RestMethod -Uri "$api/api/features" -TimeoutSec 20
+    $f = Invoke-RestMethod -Headers $authHeaders -Uri "$api/api/features" -TimeoutSec 20
     $all = Flatten $f.features
     $all | Where-Object { $_.description -in @('Coord - X', 'Coord - Y', 'Coord - Z') } |
         Select-Object -First 3
@@ -68,13 +72,13 @@ Start-Process -FilePath $trainer -WindowStyle Hidden
 $features = $null
 foreach ($i in 1..30) {
     Start-Sleep -Seconds 1
-    try { $features = Invoke-RestMethod -Uri "$api/api/features" -TimeoutSec 3; break } catch {}
+    try { $features = Invoke-RestMethod -Headers $authHeaders -Uri "$api/api/features" -TimeoutSec 3; break } catch {}
 }
 if (-not $features) { Fail 'REST API never came up'; exit 1 }
 Pass 'REST API up'
 
 foreach ($i in 1..15) {
-    $features = Invoke-RestMethod -Uri "$api/api/features" -TimeoutSec 10
+    $features = Invoke-RestMethod -Headers $authHeaders -Uri "$api/api/features" -TimeoutSec 10
     if ($features.process.attached) { break }
     Start-Sleep -Seconds 1
 }
@@ -87,7 +91,7 @@ $r = Toggle '}]}{][{}{}{}Main CodeBase}]}{][{}{}{}'
 if ($r.error) { Fail "Main CodeBase: $($r.error)" } else { Pass "Main CodeBase enabled (active=$($r.active))" }
 Start-Sleep -Seconds 3
 
-$syms = try { Invoke-RestMethod -Uri "$api/api/debug/symbols" -TimeoutSec 15 } catch { $null }
+$syms = try { Invoke-RestMethod -Headers $authHeaders -Uri "$api/api/debug/symbols" -TimeoutSec 15 } catch { $null }
 if ($syms) {
     Info "$($syms.count) symbols registered"
     foreach ($n in @('_pPlayer', '_pPos', '_GodMode', '_pStaminaBase')) {
@@ -145,7 +149,7 @@ Info ("before: X={0} Y={1} Z={2}" -f $before['Coord - X'], $before['Coord - Y'],
 $newX = $before['Coord - X'] + 25
 $body = @{ description = 'Coord - X'; value = "$newX" } | ConvertTo-Json -Compress
 $w = try {
-    Invoke-RestMethod -Uri "$api/api/features/set" -Method Post `
+    Invoke-RestMethod -Headers $authHeaders -Uri "$api/api/features/set" -Method Post `
         -ContentType 'application/json' -Body $body -TimeoutSec 20
 } catch { @{ error = $_.Exception.Message } }
 
@@ -167,5 +171,5 @@ if ([math]::Abs([double]$movedX - $newX) -lt 5) {
 
 Write-Host ''
 Info 'Trainer still running. Stop it cleanly so the game keeps its original bytes:'
-Info '  Invoke-RestMethod http://127.0.0.1:42069/api/features/deactivate_all -Method Post'
+Info '  Invoke-RestMethod -Headers $authHeaders http://127.0.0.1:42069/api/features/deactivate_all -Method Post'
 Info '  Get-Process rdr2_trainer | Stop-Process -Force'

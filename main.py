@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import signal
+import socket
 import subprocess
 import time
 import urllib.error
@@ -32,6 +33,7 @@ import decky
 import generate
 import library
 import remote
+import trainer_auth
 
 LOG = "[DeckyTrainers]"
 
@@ -389,16 +391,34 @@ def socket_owner_pids(port: int, proc: str = "/proc"):
 # ------------------------------------------------------------------ HTTP (sync)
 
 
-def http_json(method: str, url: str, body=None, timeout: float = 10.0):
+def _port_is_listening(port: int) -> bool:
+    """Catch a listener that timed out or did not speak HTTP during the probe."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def http_json(method: str, url: str, body=None, timeout: float = 10.0,
+              *, auth_secret: str):
     """Blocking JSON request. Returns (status, parsed_body_or_text)."""
     data = None
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {auth_secret}"}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        # Keep the credential on this loopback request, even if the environment
+        # configures an HTTP proxy or a server responds with a redirect.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        with opener.open(request, timeout=timeout) as response:
             payload = response.read().decode("utf-8", "replace")
             status = response.status
     except urllib.error.HTTPError as error:
@@ -422,6 +442,7 @@ class Plugin:
             decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json"
         )
         self._load_settings()
+        self._auth_secret = trainer_auth.load_secret(decky.DECKY_PLUGIN_SETTINGS_DIR)
 
         self.proc = None
         self.trainer_name = ""
@@ -497,6 +518,12 @@ class Plugin:
 
     def _base_url(self) -> str:
         return f"http://127.0.0.1:{self._port()}"
+
+    def _trainer_request(self, method: str, path: str, body=None,
+                         timeout: float = 10.0):
+        """Blocking authenticated transport, shared by probes and actions."""
+        return http_json(method, self._base_url() + path, body, timeout,
+                         auth_secret=self._auth_secret)
 
     async def get_settings(self):
         return dict(self.settings)
@@ -870,8 +897,25 @@ class Plugin:
     # -- launch --------------------------------------------------------------
 
     async def launch_trainer(self, appid: str, trainer_path: str):
-        if await self._api_up(timeout=1.0):
+        status = await self._api_status(timeout=1.0)
+        if status in (401, 403):
+            return {
+                "ok": False,
+                "error": (
+                    f"the trainer on port {self._port()} rejected the authentication "
+                    f"secret (HTTP {status}). Stop the running trainer and restart "
+                    "the plugin before trying again."
+                ),
+            }
+        if status is not None and 200 <= status < 300:
             return {"ok": False, "error": f"a trainer is already running on port {self._port()}"}
+        if status is not None or await asyncio.to_thread(_port_is_listening, self._port()):
+            detail = f" (HTTP {status})" if status is not None else ""
+            return {
+                "ok": False,
+                "error": f"port {self._port()} is already in use{detail} — stop the "
+                         "trainer or service using it before starting another trainer",
+            }
 
         if not os.path.isfile(trainer_path):
             return {"ok": False, "error": f"trainer not found: {trainer_path}"}
@@ -903,6 +947,7 @@ class Plugin:
         env, env_error = wine_env_for(env)
         if env_error:
             return {"ok": False, "error": env_error}
+        env[trainer_auth.SECRET_ENV] = self._auth_secret
 
         decky.logger.info(
             f"{LOG} launching {trainer_path} via {wine} in prefix "
@@ -913,6 +958,7 @@ class Plugin:
             self.proc = await asyncio.to_thread(
                 _spawn, wine, trainer_path, env, os.path.dirname(trainer_path),
                 os.path.join(decky.DECKY_PLUGIN_LOG_DIR, "trainer.log"),
+                self._port(),
             )
         except Exception as error:
             decky.logger.error(f"{LOG} spawn failed: {error}")
@@ -948,14 +994,19 @@ class Plugin:
             "attachHint": hint,
         }
 
-    async def _api_up(self, timeout: float = 2.0) -> bool:
+    async def _api_status(self, timeout: float = 2.0):
+        """HTTP status, including authentication failures; None if unavailable."""
         try:
             status, _ = await asyncio.to_thread(
-                http_json, "GET", f"{self._base_url()}/api/features", None, timeout
+                self._trainer_request, "GET", "/api/features", None, timeout
             )
-            return status < 500
+            return status
         except Exception:
-            return False
+            return None
+
+    async def _api_up(self, timeout: float = 2.0) -> bool:
+        status = await self._api_status(timeout)
+        return status is not None and 200 <= status < 300
 
     async def _wait_for_api(self, timeout: float = 30.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -974,12 +1025,12 @@ class Plugin:
         status, payload = None, None
         try:
             status, payload = await asyncio.to_thread(
-                http_json, "GET", f"{self._base_url()}/api/features", None, 2.0
+                self._trainer_request, "GET", "/api/features", None, 2.0
             )
         except Exception:
             pass
 
-        if status is None or status >= 500:
+        if status is None or not 200 <= status < 300:
             return {"apiUp": False, "attached": False}
 
         if not self.trainer_name:
@@ -1057,9 +1108,9 @@ class Plugin:
         if api_up:
             try:
                 status, payload = await asyncio.to_thread(
-                    http_json, "GET", f"{self._base_url()}/api/features", None, 3.0
+                    self._trainer_request, "GET", "/api/features", None, 3.0
                 )
-                if status < 400 and isinstance(payload, dict):
+                if 200 <= status < 300 and isinstance(payload, dict):
                     process_block = payload.get("process") or {}
                     attached = bool(process_block.get("attached"))
                     game_exe = process_block.get("processName") or game_exe
@@ -1132,9 +1183,9 @@ class Plugin:
         unhooked = None
         try:
             status, payload = await asyncio.to_thread(
-                http_json, "POST", f"{self._base_url()}/api/shutdown", {}, ACTION_TIMEOUT,
+                self._trainer_request, "POST", "/api/shutdown", {}, ACTION_TIMEOUT,
             )
-            if status < 400 and isinstance(payload, dict):
+            if 200 <= status < 300 and isinstance(payload, dict):
                 unhooked = payload.get("deactivated", 0)
                 decky.logger.info(
                     f"{LOG} trainer shut itself down: restored {unhooked} script(s), "
@@ -1241,18 +1292,17 @@ class Plugin:
         """Proxy a HATEOAS action to the trainer, sidestepping mixed-content rules."""
         if not path.startswith("/"):
             path = "/" + path
-        url = self._base_url() + path
         method = method.upper()
         timeout = READ_TIMEOUT if method == "GET" else ACTION_TIMEOUT
         try:
             status, payload = await asyncio.to_thread(
-                http_json, method, url, body, timeout
+                self._trainer_request, method, path, body, timeout
             )
         except Exception as error:
             decky.logger.error(f"{LOG} api_request {method} {path} failed: {error}")
             return {"ok": False, "status": 0, "error": str(error)}
 
-        if status >= 400:
+        if not 200 <= status < 300:
             error = None
             if isinstance(payload, dict):
                 error = payload.get("error")
@@ -1263,7 +1313,8 @@ class Plugin:
         return {"ok": True, "status": status, "data": payload}
 
 
-def _spawn(wine: str, trainer_path: str, env: dict, cwd: str, log_path: str):
+def _spawn(wine: str, trainer_path: str, env: dict, cwd: str, log_path: str,
+           port: int = DEFAULT_PORT):
     """Start `trainer_path` under `wine`, in the game's prefix.
 
     `env` must already be the game's environment as prepared by
@@ -1279,7 +1330,7 @@ def _spawn(wine: str, trainer_path: str, env: dict, cwd: str, log_path: str):
         sink = subprocess.DEVNULL
     try:
         return subprocess.Popen(
-            [wine, trainer_path],
+            [wine, trainer_path, "--port", str(port)],
             cwd=cwd or None,
             env=env,
             stdout=sink,

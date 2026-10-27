@@ -18,6 +18,8 @@ coverage
 
 # API keys and secrets
 .env
+.auth-trainer-secret
+.auth-trainer-secret.*
 
 # Dependency directory
 node_modules

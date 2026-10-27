@@ -1,3 +1,4 @@
+use crate::api_auth::ApiAuth;
 use crate::memory_record::{MemoryRecord, VariableType};
 use crate::process::GameProcess;
 use crate::lua_engine::{ExecEnv, LuaAction, LuaCtx, LuaEngine, RecordView};
@@ -228,15 +229,21 @@ pub fn apply_lua_actions(
 
 pub type SharedState = Arc<Mutex<RuntimeState>>;
 
-pub async fn start_rest_server(port: u16, state: SharedState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn start_rest_server(
+    port: u16,
+    state: SharedState,
+    auth: ApiAuth,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(addr).await?;
     info!("HATEOAS REST server listening on http://{}", addr);
+    let auth = Arc::new(auth);
 
     loop {
         let (stream, _) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let state_clone = Arc::clone(&state);
+        let auth_clone = Arc::clone(&auth);
 
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new()
@@ -244,7 +251,8 @@ pub async fn start_rest_server(port: u16, state: SharedState) -> Result<(), Box<
                     io,
                     service_fn(move |req| {
                         let state = Arc::clone(&state_clone);
-                        async move { handle_request(req, state).await }
+                        let auth = Arc::clone(&auth_clone);
+                        async move { handle_request(req, state, &auth).await }
                     }),
                 )
                 .await
@@ -276,20 +284,32 @@ fn find_record_mut<'a>(records: &'a mut [MemoryRecord], id: Option<u32>, desc: O
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     state: SharedState,
+    auth: &ApiAuth,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let method = req.method();
-    let path = req.uri().path();
 
-    // CORS preflight
+    // Browsers send preflights without the bearer token. This only advertises
+    // CORS permissions; the subsequent API request must authenticate below.
     if method == Method::OPTIONS {
         return Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
             .header("Access-Control-Allow-Origin", "*")
             .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            .header("Access-Control-Allow-Headers", "Content-Type")
-            .body(Full::new(Bytes::from("")))
+            .header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            .body(Full::new(Bytes::new()))
             .unwrap());
     }
+
+    // Gate every API operation before reading a body, taking the state lock,
+    // or doing anything that can inspect or mutate the game.
+    if !auth.authorized(req.headers()) {
+        let mut response = json_response(StatusCode::UNAUTHORIZED, r#"{"error":"Unauthorized"}"#);
+        response
+            .headers_mut()
+            .insert("WWW-Authenticate", "Bearer".parse().unwrap());
+        return Ok(response);
+    }
+    let path = req.uri().path();
 
     match (method, path) {
         (&Method::GET, "/api/features") => {
@@ -929,6 +949,8 @@ fn json_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
         .status(status)
         .header("Content-Type", "application/json; charset=utf-8")
         .header("Access-Control-Allow-Origin", "*")
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap()
 }
