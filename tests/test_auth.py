@@ -113,7 +113,7 @@ class PluginAuthTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((await self.plugin.api_request("POST", "/api/features/toggle", {"id": 1}))["ok"])
             self.plugin._trainer_procs = AsyncMock(side_effect=[{"123"}, set()])
             self.assertTrue((await self.plugin.stop_trainer())["ok"])
-        self.assertGreaterEqual(transport.call_count, 6)
+        self.assertEqual(transport.call_count, 5)
         for call in transport.call_args_list:
             self.assertEqual(call.kwargs["auth_secret"], self.plugin._auth_secret)
             self.assertTrue(call.args[1].startswith("http://127.0.0.1:"))
@@ -138,7 +138,7 @@ class PluginAuthTests(unittest.IsolatedAsyncioTestCase):
         trainer.write_bytes(b"MZ")
         game_env = {"WINEPREFIX": "/game/pfx", trainer_auth.SECRET_ENV: "untrusted"}
         self.plugin.settings["port"] = 42345
-        self.plugin._api_status = AsyncMock(return_value=None)
+        self.plugin._probe_trainer = AsyncMock(return_value=main.TrainerProbe(False, False))
         self.plugin._wait_for_api = AsyncMock(return_value=True)
         with patch.object(main, "find_game_process", return_value=("123", "game.exe", game_env)), \
                 patch.object(main, "resolve_wine", return_value="/proton/wine"), \

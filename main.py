@@ -19,6 +19,7 @@ Stdlib only — nothing to pip install on the Deck.
 """
 
 import asyncio
+from dataclasses import dataclass
 import json
 import os
 import signal
@@ -435,6 +436,16 @@ def http_json(method: str, url: str, body=None, timeout: float = 10.0,
 # ------------------------------------------------------------------- the plugin
 
 
+@dataclass(frozen=True)
+class TrainerProbe:
+    reachable: bool
+    authenticated: bool
+    status: int | None = None
+    payload: object = None
+    busy: bool = False
+    error: str | None = None
+
+
 class Plugin:
     async def _main(self):
         self.settings = dict(DEFAULT_SETTINGS)
@@ -444,13 +455,7 @@ class Plugin:
         self._load_settings()
         self._auth_secret = trainer_auth.load_secret(decky.DECKY_PLUGIN_SETTINGS_DIR)
 
-        self.proc = None
-        self.trainer_name = ""
-        self.trainer_path = ""
-        self.prefix_path = ""
-        self.game_exe = ""
-        self.adopted = False
-        self.sidecar_process = ""
+        self._reset_trainer_state()
 
         try:
             os.makedirs(self._trainer_dir(), exist_ok=True)
@@ -897,25 +902,20 @@ class Plugin:
     # -- launch --------------------------------------------------------------
 
     async def launch_trainer(self, appid: str, trainer_path: str):
-        status = await self._api_status(timeout=1.0)
-        if status in (401, 403):
-            return {
-                "ok": False,
-                "error": (
-                    f"the trainer on port {self._port()} rejected the authentication "
-                    f"secret (HTTP {status}). Stop the running trainer and restart "
-                    "the plugin before trying again."
-                ),
-            }
-        if status is not None and 200 <= status < 300:
+        probe = await self._probe_trainer(timeout=1.0)
+        if probe.status in (401, 403):
+            return {"ok": False, "error": probe.error}
+        if probe.authenticated:
             return {"ok": False, "error": f"a trainer is already running on port {self._port()}"}
-        if status is not None or await asyncio.to_thread(_port_is_listening, self._port()):
-            detail = f" (HTTP {status})" if status is not None else ""
+        if probe.reachable:
+            detail = f" (HTTP {probe.status})" if probe.status is not None else ""
             return {
                 "ok": False,
                 "error": f"port {self._port()} is already in use{detail} — stop the "
                          "trainer or service using it before starting another trainer",
             }
+        if any(process_alive(pid) for pid in getattr(self, "_pending_stop_pids", ())):
+            return {"ok": False, "error": "a trainer process is still running — stop it before launching another trainer"}
 
         if not os.path.isfile(trainer_path):
             return {"ok": False, "error": f"trainer not found: {trainer_path}"}
@@ -964,6 +964,8 @@ class Plugin:
             decky.logger.error(f"{LOG} spawn failed: {error}")
             return {"ok": False, "error": f"could not start the trainer: {error}"}
 
+        self._last_attached = None
+        self._probe_port = self._port()
         self.trainer_path = trainer_path
         self.trainer_name = os.path.basename(trainer_path)
         self.prefix_path = env.get("STEAM_COMPAT_DATA_PATH", "")
@@ -994,19 +996,44 @@ class Plugin:
             "attachHint": hint,
         }
 
-    async def _api_status(self, timeout: float = 2.0):
-        """HTTP status, including authentication failures; None if unavailable."""
+    async def _probe_trainer(self, timeout: float = 2.0) -> TrainerProbe:
+        """Read health and state once; a rejected secret still means a live listener."""
+        port = self._port()
         try:
-            status, _ = await asyncio.to_thread(
+            status, payload = await asyncio.to_thread(
                 self._trainer_request, "GET", "/api/features", None, timeout
             )
-            return status
         except Exception:
-            return None
+            reachable = await asyncio.to_thread(_port_is_listening, port)
+            if self._port() != port:
+                return await self._probe_trainer(timeout=timeout)
+            return TrainerProbe(
+                reachable=reachable, authenticated=False,
+                error="trainer API did not respond" if reachable else None,
+            )
+
+        # Settings can change while HTTP runs in a worker. Do not apply an old
+        # port's payload to the newly selected trainer's attachment cache.
+        if self._port() != port:
+            return await self._probe_trainer(timeout=timeout)
+        authenticated = 200 <= status < 300
+        error = None
+        if status in (401, 403):
+            error = (
+                f"the trainer on port {self._port()} rejected the authentication "
+                f"secret (HTTP {status}). Stop the running trainer and restart "
+                "the plugin before trying again."
+            )
+        elif not authenticated:
+            error = f"trainer API returned HTTP {status}"
+        return TrainerProbe(
+            reachable=True, authenticated=authenticated, status=status, payload=payload,
+            busy=authenticated and isinstance(payload, dict) and payload.get("busy") is True,
+            error=error,
+        )
 
     async def _api_up(self, timeout: float = 2.0) -> bool:
-        status = await self._api_status(timeout)
-        return status is not None and 200 <= status < 300
+        return (await self._probe_trainer(timeout=timeout)).authenticated
 
     async def _wait_for_api(self, timeout: float = 30.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -1022,44 +1049,41 @@ class Plugin:
     # -- detect / adopt ------------------------------------------------------
 
     async def detect_trainer(self):
-        status, payload = None, None
-        try:
-            status, payload = await asyncio.to_thread(
-                self._trainer_request, "GET", "/api/features", None, 2.0
-            )
-        except Exception:
-            pass
-
-        if status is None or not 200 <= status < 300:
-            return {"apiUp": False, "attached": False}
-
-        if not self.trainer_name:
+        probe = await self._probe_trainer(timeout=2.0)
+        if probe.authenticated and not self.trainer_name:
+            port = self._port()
             await asyncio.to_thread(self._adopt_from_socket)
+            if self._port() != port:
+                probe = await self._probe_trainer(timeout=2.0)
+        return self._probe_state(probe)
 
-        trainer_block = {}
-        process_block = {}
-        if isinstance(payload, dict):
-            trainer_block = payload.get("trainer") or {}
-            process_block = payload.get("process") or {}
-
-        name = trainer_block.get("name") or trainer_block.get("exe") or self.trainer_name
-        if name and not self.trainer_name:
-            self.trainer_name = name
-
-        game_exe = process_block.get("processName") or self.game_exe
-        if game_exe:
-            self.game_exe = game_exe
-
-        self.sidecar_process = self._installed_process()
+    def _probe_state(self, probe: TrainerProbe):
+        """Busy responses omit process data; retain the last explicit attachment state."""
+        port = self._port()
+        if getattr(self, "_probe_port", None) != port or not probe.reachable:
+            self._last_attached = None
+        self._probe_port = port
+        if probe.authenticated and not probe.busy and isinstance(probe.payload, dict):
+            trainer = probe.payload.get("trainer")
+            if isinstance(trainer, dict) and not self.trainer_name:
+                self.trainer_name = trainer.get("name") or trainer.get("exe") or ""
+            process = probe.payload.get("process")
+            if isinstance(process, dict):
+                if isinstance(process.get("attached"), bool):
+                    self._last_attached = process["attached"]
+                self.game_exe = process.get("processName") or self.game_exe
 
         return {
-            "apiUp": True,
-            "trainerName": self.trainer_name or name or "",
-            "attached": bool(process_block.get("attached")),
-            "gameExe": game_exe or "",
-            # The sidecar's curated name wins: it's the one recorded when this
-            # trainer was built, where `game_exe` may be whatever /proc showed.
-            "attachHint": self.sidecar_process or game_exe or "",
+            "apiUp": probe.authenticated,
+            "reachable": probe.reachable,
+            "authenticated": probe.authenticated,
+            "busy": probe.busy,
+            "status": probe.status,
+            "error": probe.error,
+            "trainerName": self.trainer_name,
+            "attached": self._last_attached if probe.authenticated else None,
+            "gameExe": self.game_exe or "",
+            "attachHint": self._installed_process() or self.game_exe or "",
         }
 
     def _adopt_from_socket(self):
@@ -1102,30 +1126,12 @@ class Plugin:
     # -- status --------------------------------------------------------------
 
     async def get_trainer_status(self):
-        api_up = await self._api_up(timeout=2.0)
-        attached = False
-        game_exe = self.game_exe
-        if api_up:
-            try:
-                status, payload = await asyncio.to_thread(
-                    self._trainer_request, "GET", "/api/features", None, 3.0
-                )
-                if 200 <= status < 300 and isinstance(payload, dict):
-                    process_block = payload.get("process") or {}
-                    attached = bool(process_block.get("attached"))
-                    game_exe = process_block.get("processName") or game_exe
-            except Exception:
-                pass
-
-        running = api_up or bool(await self._trainer_procs())
+        probe = await self._probe_trainer(timeout=2.0)
+        state = self._probe_state(probe)
         return {
-            "running": running,
-            "apiUp": api_up,
-            "attached": attached,
-            "gameExe": game_exe or "",
-            "trainerName": self.trainer_name,
+            **state,
+            "running": probe.reachable or bool(await self._trainer_procs()),
             "adopted": self.adopted,
-            "attachHint": self._installed_process() or game_exe or "",
         }
 
     # -- stop ----------------------------------------------------------------
@@ -1142,7 +1148,8 @@ class Plugin:
         trainer from a same-named one in another prefix. What's left is the
         filename, and the port's owner is authoritative either way.
         """
-        pids = set(socket_owner_pids(self._port()))
+        pids = {pid for pid in getattr(self, "_pending_stop_pids", ()) if process_alive(pid)}
+        pids.update(socket_owner_pids(self._port()))
         if self.trainer_name:
             needle = self.trainer_name.lower()
             for pid in iter_pids():
@@ -1160,10 +1167,51 @@ class Plugin:
         if not self.trainer_name:
             await asyncio.to_thread(self._adopt_from_socket)
 
-        pids = await self._trainer_procs()
-        if not pids:
-            self._reset_trainer_state()
-            return {"ok": True, "killed": 0, "apiUp": False, "unhooked": None}
+        known_pids = set(await self._trainer_procs())
+        known_pids.update(
+            pid for pid in getattr(self, "_pending_stop_pids", ()) if process_alive(pid)
+        )
+        signalled = set()
+        unhooked = None
+
+        async def remaining_pids():
+            # A process can close its socket or disappear from the name scan
+            # before it exits. Keep checking every PID we already identified.
+            known_pids.update(await self._trainer_procs())
+            return {pid for pid in known_pids if process_alive(pid)}
+
+        async def wait_for_exit(ticks, interval):
+            for tick in range(ticks + 1):
+                survivors = await remaining_pids()
+                listening = await asyncio.to_thread(_port_is_listening, self._port())
+                if not survivors and not listening:
+                    break
+                if tick < ticks:
+                    await asyncio.sleep(interval)
+            return survivors, listening
+
+        async def result(survivors, listening, probe=None):
+            killed = len(signalled - survivors)
+            if not survivors and not listening:
+                self._reset_trainer_state()
+                return {"ok": True, "killed": killed, "apiUp": False,
+                        "reachable": False, "unhooked": unhooked, "error": None}
+            if probe is None:
+                probe = await self._probe_trainer(timeout=1.0)
+            detail = "trainer process is still running" if survivors else "trainer port is still in use"
+            if probe.error:
+                detail += f"; {probe.error}"
+            # Failed termination must keep our process handle and identity so
+            # the next stop can still find a trainer whose API is inaccessible.
+            self._pending_stop_pids = set(survivors)
+            return {"ok": False, "killed": killed, "apiUp": probe.authenticated,
+                    "reachable": listening or probe.reachable, "unhooked": unhooked,
+                    "error": detail}
+
+        if not known_pids:
+            probe = await self._probe_trainer(timeout=1.0)
+            if not probe.authenticated:
+                return await result(set(), probe.reachable, probe)
 
         # Ask the trainer to shut itself down, and only fall back to signals if
         # that does not work.
@@ -1180,7 +1228,6 @@ class Plugin:
         # `POST /api/shutdown` un-patches and exits from inside the trainer,
         # where the ordering is actually controlled, and reports what it
         # restored. So a clean stop is confirmed rather than assumed.
-        unhooked = None
         try:
             status, payload = await asyncio.to_thread(
                 self._trainer_request, "POST", "/api/shutdown", {}, ACTION_TIMEOUT,
@@ -1202,12 +1249,10 @@ class Plugin:
         # The endpoint replies *then* exits, so the process outlives the
         # response by a fraction of a second by design.
         if unhooked is not None:
-            for _ in range(SHUTDOWN_GRACE_TICKS):
-                if not await self._trainer_procs():
-                    decky.logger.info(f"{LOG} trainer exited on its own; nothing to kill")
-                    self._reset_trainer_state()
-                    return {"ok": True, "killed": 0, "apiUp": False, "unhooked": unhooked}
-                await asyncio.sleep(SHUTDOWN_TICK)
+            survivors, listening = await wait_for_exit(SHUTDOWN_GRACE_TICKS, SHUTDOWN_TICK)
+            if not survivors and not listening:
+                decky.logger.info(f"{LOG} trainer exited on its own; nothing to kill")
+                return await result(survivors, listening)
             decky.logger.warning(
                 f"{LOG} trainer un-patched but is still running — signalling it"
             )
@@ -1216,30 +1261,18 @@ class Plugin:
         # common reason /api/shutdown fails is that the trainer had already
         # exited, and signalling PIDs that are gone would report a kill count
         # for work nobody did.
-        pids = await self._trainer_procs()
-        if not pids:
-            decky.logger.info(f"{LOG} trainer already gone; nothing to signal")
-            self._reset_trainer_state()
-            return {"ok": True, "killed": 0, "apiUp": False, "unhooked": unhooked}
+        pids = await remaining_pids()
 
         # SIGTERM first, and mean it: SIGKILL is the last resort, not the first
         # move.
-        signalled = 0
         for pid in pids:
             try:
                 os.kill(int(pid), signal.SIGTERM)
-                signalled += 1
+                signalled.add(pid)
             except (OSError, ValueError) as error:
                 decky.logger.warning(f"{LOG} could not signal {pid}: {error}")
 
-        survivors = set(pids)
-        for _ in range(SHUTDOWN_GRACE_TICKS):
-            survivors = {pid for pid in survivors if process_alive(pid)}
-            if not survivors:
-                break
-            await asyncio.sleep(SHUTDOWN_TICK)
-
-        killed = signalled
+        survivors, listening = await wait_for_exit(SHUTDOWN_GRACE_TICKS, SHUTDOWN_TICK)
         for pid in survivors:
             decky.logger.warning(
                 f"{LOG} {pid} ignored SIGTERM after "
@@ -1247,35 +1280,20 @@ class Plugin:
             )
             try:
                 os.kill(int(pid), signal.SIGKILL)
+                signalled.add(pid)
             except (OSError, ValueError) as error:
                 decky.logger.warning(f"{LOG} could not kill {pid}: {error}")
-                killed -= 1
 
+        # Signal delivery and failed authentication prove nothing about exit.
+        # Confirm both the tracked PIDs and the listener have actually gone.
+        if survivors or listening:
+            survivors, listening = await wait_for_exit(10, 0.3)
+        stopped = await result(survivors, listening)
         decky.logger.info(
-            f"{LOG} stopped {killed} trainer process(es) "
-            f"({len(survivors)} needed SIGKILL)"
+            f"{LOG} shutdown confirmed={stopped['ok']}; "
+            f"{stopped['killed']} signalled process(es) exited"
         )
-
-        # Confirm by re-probing the port — it should refuse now.
-        api_up = True
-        for _ in range(10):
-            await asyncio.sleep(0.3)
-            api_up = await self._api_up(timeout=1.0)
-            if not api_up:
-                break
-
-        if not api_up:
-            self._reset_trainer_state()
-        return {
-            "ok": not api_up,
-            "killed": killed,
-            "apiUp": api_up,
-            # None means the trainer never confirmed an un-patch, so the game
-            # may still be hooked — which is what makes the *next* injection
-            # fail rather than this one.
-            "unhooked": unhooked,
-            "error": None if not api_up else "trainer still answering after kill",
-        }
+        return stopped
 
     def _reset_trainer_state(self):
         self.proc = None
@@ -1285,6 +1303,9 @@ class Plugin:
         self.game_exe = ""
         self.adopted = False
         self.sidecar_process = ""
+        self._probe_port = None
+        self._last_attached = None
+        self._pending_stop_pids = set()
 
     # -- API proxy -----------------------------------------------------------
 
