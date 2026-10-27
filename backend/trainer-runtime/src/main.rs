@@ -1,4 +1,5 @@
 mod address_parser;
+mod api_auth;
 mod assembler;
 mod aob_scanner;
 mod auto_assembler;
@@ -49,6 +50,10 @@ async fn main() -> Result<()> {
     if args.len() > 2 && args[1] == "--analyze" {
         return analyze_table(&args[2], args.get(3).map(|s| s.as_str()));
     }
+
+    // Fail before loading table code or touching a process if no credential
+    // was supplied. Offline analysis above intentionally needs no credential.
+    let auth = api_auth::ApiAuth::from_env()?;
 
     let self_exe_name = env::current_exe()
         .ok()
@@ -176,7 +181,7 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(42069);
 
-    if let Err(e) = start_rest_server(port, state).await {
+    if let Err(e) = start_rest_server(port, state, auth).await {
         // Bare "os error 10048" is unhelpful; name the actual problem.
         if e.to_string().contains("10048") || e.to_string().contains("in use") {
             anyhow::bail!(

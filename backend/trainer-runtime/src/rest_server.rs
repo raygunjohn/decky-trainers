@@ -1,8 +1,9 @@
+use crate::api_auth::ApiAuth;
 use crate::memory_record::{MemoryRecord, VariableType};
 use crate::process::GameProcess;
 use crate::lua_engine::{ExecEnv, LuaAction, LuaCtx, LuaEngine, RecordView};
 use crate::symbol_handler::SymbolHandler;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -14,6 +15,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
+
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
 pub struct RuntimeState {
     pub process: Option<GameProcess>,
@@ -228,15 +231,21 @@ pub fn apply_lua_actions(
 
 pub type SharedState = Arc<Mutex<RuntimeState>>;
 
-pub async fn start_rest_server(port: u16, state: SharedState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn start_rest_server(
+    port: u16,
+    state: SharedState,
+    auth: ApiAuth,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(addr).await?;
     info!("HATEOAS REST server listening on http://{}", addr);
+    let auth = Arc::new(auth);
 
     loop {
         let (stream, _) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let state_clone = Arc::clone(&state);
+        let auth_clone = Arc::clone(&auth);
 
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new()
@@ -244,7 +253,8 @@ pub async fn start_rest_server(port: u16, state: SharedState) -> Result<(), Box<
                     io,
                     service_fn(move |req| {
                         let state = Arc::clone(&state_clone);
-                        async move { handle_request(req, state).await }
+                        let auth = Arc::clone(&auth_clone);
+                        async move { handle_request(req, state, &auth).await }
                     }),
                 )
                 .await
@@ -276,20 +286,51 @@ fn find_record_mut<'a>(records: &'a mut [MemoryRecord], id: Option<u32>, desc: O
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     state: SharedState,
+    auth: &ApiAuth,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let method = req.method();
-    let path = req.uri().path();
 
-    // CORS preflight
+    // Browsers send preflights without the bearer token. This only advertises
+    // CORS permissions; the subsequent API request must authenticate below.
     if method == Method::OPTIONS {
         return Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
             .header("Access-Control-Allow-Origin", "*")
             .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            .header("Access-Control-Allow-Headers", "Content-Type")
-            .body(Full::new(Bytes::from("")))
+            .header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            .body(Full::new(Bytes::new()))
             .unwrap());
     }
+
+    // Gate every API operation before reading a body, taking the state lock,
+    // or doing anything that can inspect or mutate the game.
+    if !auth.authorized(req.headers()) {
+        let mut response = json_response(StatusCode::UNAUTHORIZED, r#"{"error":"Unauthorized"}"#);
+        response
+            .headers_mut()
+            .insert("WWW-Authenticate", "Bearer".parse().unwrap());
+        return Ok(response);
+    }
+    // Check the declared size without waiting for bytes, then enforce the same
+    // limit while streaming (including chunked requests without Content-Length).
+    // Read before routing so even endpoints that ignore bodies cannot mutate
+    // state or shut down the trainer on an oversized request.
+    if req
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok()?.parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_REQUEST_BODY_BYTES as u64)
+    {
+        return Ok(body_too_large_response());
+    }
+    let (parts, body) = req.into_parts();
+    let body_bytes = match Limited::new(body, MAX_REQUEST_BODY_BYTES).collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(error) if error.is::<LengthLimitError>() => return Ok(body_too_large_response()),
+        Err(_) => return Ok(json_response(StatusCode::BAD_REQUEST, r#"{"error":"Invalid body"}"#)),
+    };
+    let method = &parts.method;
+    let path = parts.uri.path();
 
     match (method, path) {
         (&Method::GET, "/api/features") => {
@@ -318,11 +359,6 @@ async fn handle_request(
             }
         }
         (&Method::POST, "/api/features/toggle") => {
-            let body_bytes = match read_body(req).await {
-                Ok(b) => b,
-                Err(_) => return Ok(json_response(StatusCode::BAD_REQUEST, r#"{"error":"Invalid body"}"#)),
-            };
-
             #[derive(Deserialize)]
             struct ToggleReq {
                 id: Option<u32>,
@@ -402,11 +438,6 @@ async fn handle_request(
             }
         }
         (&Method::POST, "/api/features/set") => {
-            let body_bytes = match read_body(req).await {
-                Ok(b) => b,
-                Err(_) => return Ok(json_response(StatusCode::BAD_REQUEST, r#"{"error":"Invalid body"}"#)),
-            };
-
             #[derive(Deserialize)]
             struct SetReq {
                 id: Option<u32>,
@@ -503,7 +534,7 @@ async fn handle_request(
         // Diagnostics: resolve an address expression and dump bytes there.
         // `GET /api/debug/read?expr=_pPos&size=16`
         (&Method::GET, "/api/debug/read") => {
-            let query = req.uri().query().unwrap_or("").to_string();
+            let query = parts.uri.query().unwrap_or("").to_string();
             let mut expr = String::new();
             let mut size = 16usize;
             for pair in query.split('&') {
@@ -660,10 +691,6 @@ async fn handle_request(
         // Diagnostics: write raw bytes at an address expression.
         // `POST /api/debug/write  {"expr":"RDR2.exe+9C2467","bytes":"0F 10 59 70"}`
         (&Method::POST, "/api/debug/write") => {
-            let body_bytes = match read_body(req).await {
-                Ok(b) => b,
-                Err(_) => return Ok(json_response(StatusCode::BAD_REQUEST, r#"{"error":"bad body"}"#)),
-            };
             #[derive(Deserialize)]
             struct W {
                 expr: String,
@@ -703,7 +730,7 @@ async fn handle_request(
         }
         // `GET /api/debug/scan?module=RDR2.exe&pattern=48+8B+03+4D+03+F6`
         (&Method::GET, "/api/debug/scan") => {
-            let query = req.uri().query().unwrap_or("").to_string();
+            let query = parts.uri.query().unwrap_or("").to_string();
             let (mut module, mut pattern) = (String::new(), String::new());
             for pair in query.split('&') {
                 match pair.split_once('=') {
@@ -739,10 +766,6 @@ async fn handle_request(
             }
         }
         (&Method::POST, "/api/process/attach") => {
-            let body_bytes = match read_body(req).await {
-                Ok(b) => b,
-                Err(_) => return Ok(json_response(StatusCode::BAD_REQUEST, r#"{"error":"Invalid body"}"#)),
-            };
 
             #[derive(Deserialize)]
             struct AttachReq {
@@ -918,10 +941,16 @@ fn build_features_json(state: &RuntimeState) -> serde_json::Value {
     })
 }
 
-async fn read_body(req: Request<hyper::body::Incoming>) -> Result<Vec<u8>, hyper::Error> {
-    use http_body_util::BodyExt;
-    let bytes = req.into_body().collect().await?.to_bytes();
-    Ok(bytes.to_vec())
+fn body_too_large_response() -> Response<Full<Bytes>> {
+    let mut response = json_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        r#"{"error":"Request body exceeds 1 MiB limit"}"#,
+    );
+    // Do not drain an unbounded remainder to reuse this connection.
+    response
+        .headers_mut()
+        .insert(hyper::header::CONNECTION, "close".parse().unwrap());
+    response
 }
 
 fn json_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
@@ -929,6 +958,8 @@ fn json_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
         .status(status)
         .header("Content-Type", "application/json; charset=utf-8")
         .header("Access-Control-Allow-Origin", "*")
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap()
 }

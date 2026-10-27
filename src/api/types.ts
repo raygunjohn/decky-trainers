@@ -236,17 +236,25 @@ export interface LaunchResult extends AttachHint {
   gameExe?: string;
 }
 
-export interface DetectResult extends AttachHint {
+export interface TrainerHealth {
+  /** A listener exists, even if the secret was rejected or HTTP timed out. */
+  reachable: boolean;
+  authenticated: boolean;
   apiUp: boolean;
+  busy: boolean;
+  status: number | null;
+  error: string | null;
+  /** Last confirmed state; null until known. Busy replies retain that state. */
+  attached: boolean | null;
+}
+
+export interface DetectResult extends AttachHint, TrainerHealth {
   trainerName?: string;
-  attached: boolean;
   gameExe?: string;
 }
 
-export interface TrainerStatus extends AttachHint {
+export interface TrainerStatus extends AttachHint, TrainerHealth {
   running: boolean;
-  apiUp: boolean;
-  attached: boolean;
   gameExe: string;
   trainerName: string;
   adopted: boolean;
@@ -254,9 +262,10 @@ export interface TrainerStatus extends AttachHint {
 
 export interface StopResult {
   ok: boolean;
-  /** Processes that had to be signalled. 0 means the trainer exited on request. */
+  /** Signalled processes whose exit was confirmed. */
   killed: number;
   apiUp: boolean;
+  reachable: boolean;
   /**
    * Scripts the trainer restored before exiting, or `null` if it never
    * confirmed an un-patch (it was already gone, wedged, or had to be killed).
